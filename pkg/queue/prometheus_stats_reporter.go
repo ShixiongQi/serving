@@ -24,7 +24,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"knative.dev/serving/pkg/autoscaler"
+	network "knative.dev/networking/pkg"
 )
 
 const (
@@ -55,6 +55,9 @@ var (
 	averageProxiedConcurrentRequestsGV = newGV(
 		"queue_average_proxied_concurrent_requests",
 		"Number of proxied requests currently being handled by this pod")
+	processUptimeGV = newGV(
+		"process_uptime",
+		"The number of seconds that the process has been up")
 )
 
 func newGV(n, h string) *prometheus.GaugeVec {
@@ -66,13 +69,18 @@ func newGV(n, h string) *prometheus.GaugeVec {
 
 // PrometheusStatsReporter structure represents a prometheus stats reporter.
 type PrometheusStatsReporter struct {
-	handler         http.Handler
-	reportingPeriod time.Duration
+	handler   http.Handler
+	startTime time.Time
+
+	// RequestsPerSecond and ProxiedRequestsPerSecond need to be divided by the
+	// reporting period they were collected over to get a "per-second" value.
+	reportingPeriodSeconds float64
 
 	requestsPerSecond                prometheus.Gauge
 	proxiedRequestsPerSecond         prometheus.Gauge
 	averageConcurrentRequests        prometheus.Gauge
 	averageProxiedConcurrentRequests prometheus.Gauge
+	processUptime                    prometheus.Gauge
 }
 
 // NewPrometheusStatsReporter creates a reporter that collects and reports queue metrics.
@@ -91,7 +99,10 @@ func NewPrometheusStatsReporter(namespace, config, revision, pod string, reporti
 	}
 
 	registry := prometheus.NewRegistry()
-	for _, gv := range []*prometheus.GaugeVec{requestsPerSecondGV, proxiedRequestsPerSecondGV, averageConcurrentRequestsGV, averageProxiedConcurrentRequestsGV} {
+	for _, gv := range []*prometheus.GaugeVec{
+		requestsPerSecondGV, proxiedRequestsPerSecondGV,
+		averageConcurrentRequestsGV, averageProxiedConcurrentRequestsGV,
+		processUptimeGV} {
 		if err := registry.Register(gv); err != nil {
 			return nil, fmt.Errorf("register metric failed: %w", err)
 		}
@@ -105,27 +116,30 @@ func NewPrometheusStatsReporter(namespace, config, revision, pod string, reporti
 	}
 
 	return &PrometheusStatsReporter{
-		handler:         promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		reportingPeriod: reportingPeriod,
+		handler:   promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		startTime: time.Now(),
+
+		reportingPeriodSeconds: reportingPeriod.Seconds(),
 
 		requestsPerSecond:                requestsPerSecondGV.With(labels),
 		proxiedRequestsPerSecond:         proxiedRequestsPerSecondGV.With(labels),
 		averageConcurrentRequests:        averageConcurrentRequestsGV.With(labels),
 		averageProxiedConcurrentRequests: averageProxiedConcurrentRequestsGV.With(labels),
+		processUptime:                    processUptimeGV.With(labels),
 	}, nil
 }
 
 // Report captures request metrics.
-func (r *PrometheusStatsReporter) Report(stat autoscaler.Stat) {
+func (r *PrometheusStatsReporter) Report(stats network.RequestStatsReport) {
 	// Requests per second is a rate over time while concurrency is not.
-	r.requestsPerSecond.Set(stat.RequestCount / r.reportingPeriod.Seconds())
-	r.proxiedRequestsPerSecond.Set(stat.ProxiedRequestCount / r.reportingPeriod.Seconds())
-	r.averageConcurrentRequests.Set(stat.AverageConcurrentRequests)
-	r.averageProxiedConcurrentRequests.Set(stat.AverageProxiedConcurrentRequests)
+	r.requestsPerSecond.Set(stats.RequestCount / r.reportingPeriodSeconds)
+	r.proxiedRequestsPerSecond.Set(stats.ProxiedRequestCount / r.reportingPeriodSeconds)
+	r.averageConcurrentRequests.Set(stats.AverageConcurrency)
+	r.averageProxiedConcurrentRequests.Set(stats.AverageProxiedConcurrency)
+	r.processUptime.Set(time.Since(r.startTime).Seconds())
 }
 
-// Handler returns an uninstrumented http.Handler used to serve stats registered by this
-// PrometheusStatsReporter.
-func (r *PrometheusStatsReporter) Handler() http.Handler {
-	return r.handler
+// ServeHTTP serves the stats in prometheus format over HTTP.
+func (r *PrometheusStatsReporter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.handler.ServeHTTP(w, req)
 }

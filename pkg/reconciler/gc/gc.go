@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors.
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,133 +19,151 @@ package gc
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
-	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
+	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/serving/pkg/apis/serving"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/apis/serving/v1beta1"
-	listers "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
-	pkgreconciler "knative.dev/serving/pkg/reconciler"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	clientset "knative.dev/serving/pkg/client/clientset/versioned"
+	listers "knative.dev/serving/pkg/client/listers/serving/v1"
+	"knative.dev/serving/pkg/gc"
 	configns "knative.dev/serving/pkg/reconciler/gc/config"
 )
 
-// reconciler implements controller.Reconciler for Garbage Collection resources.
-type reconciler struct {
-	*pkgreconciler.Base
-
-	// listers index properties about resources
-	configurationLister listers.ConfigurationLister
-	revisionLister      listers.RevisionLister
-
-	configStore pkgreconciler.ConfigStore
-}
-
-// Check that our reconciler implements controller.Reconciler
-var _ controller.Reconciler = (*reconciler)(nil)
-
-// Reconcile compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Garbage Collection
-// resource with the current status of the resource.
-func (c *reconciler) Reconcile(ctx context.Context, key string) error {
-	logger := logging.FromContext(ctx)
-	ctx = c.configStore.ToContext(ctx)
-
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		logger.Errorw("Invalid resource key", zap.Error(err))
-		return nil
-	}
-
-	// Get the Configuration resource with this namespace/name.
-	config, err := c.configurationLister.Configurations(namespace).Get(name)
-	if errors.IsNotFound(err) {
-		// The resource no longer exists, in which case we stop processing.
-		logger.Errorf("Configuration %q in work queue no longer exists", key)
-		return nil
-	} else if err != nil {
-		return err
-	}
-
-	reconcileErr := c.reconcile(ctx, config)
-	if reconcileErr != nil {
-		c.Recorder.Event(config, corev1.EventTypeWarning, "InternalError", reconcileErr.Error())
-	}
-	return reconcileErr
-}
-
-func (c *reconciler) reconcile(ctx context.Context, config *v1alpha1.Configuration) error {
+// collect deletes stale revisions if they are sufficiently old
+func collect(
+	ctx context.Context,
+	client clientset.Interface,
+	revisionLister listers.RevisionLister,
+	config *v1.Configuration) pkgreconciler.Event {
 	cfg := configns.FromContext(ctx).RevisionGC
 	logger := logging.FromContext(ctx)
 
-	selector := labels.Set{serving.ConfigurationLabelKey: config.Name}.AsSelector()
-	revs, err := c.revisionLister.Revisions(config.Namespace).List(selector)
+	min, max := int(cfg.MinNonActiveRevisions), int(cfg.MaxNonActiveRevisions)
+	if max == gc.Disabled && cfg.RetainSinceCreateTime == gc.Disabled && cfg.RetainSinceLastActiveTime == gc.Disabled {
+		return nil // all deletion settings are disabled
+	}
+
+	selector := labels.SelectorFromSet(labels.Set{serving.ConfigurationLabelKey: config.Name})
+	revs, err := revisionLister.Revisions(config.Namespace).List(selector)
 	if err != nil {
 		return err
 	}
+	if len(revs) <= min {
+		return nil // not enough total revs
+	}
 
-	gcSkipOffset := cfg.StaleRevisionMinimumGenerations
+	// Filter out active revs
+	revs = nonactiveRevisions(revs, config)
 
-	if gcSkipOffset >= int64(len(revs)) {
+	if len(revs) <= min {
+		return nil // not enough non-active revs
+	}
+
+	// Sort by last active ascending (oldest first)
+	sort.Slice(revs, func(i, j int) bool {
+		a, b := revisionLastActiveTime(revs[i]), revisionLastActiveTime(revs[j])
+		return a.Before(b)
+	})
+
+	// Delete stale revisions while more than min remain, swap nonstale revisions to the end.
+	swap := len(revs)
+
+	// If we need `min` to remain, this is the max index i can reach.
+	maxIdx := len(revs) - min
+	for i := 0; i < swap; {
+		rev := revs[i]
+		switch {
+		case i >= maxIdx:
+			return nil
+		case isRevisionStale(cfg, rev, logger):
+			i++
+			logger.Info("Deleting stale revision: ", rev.ObjectMeta.Name)
+			if err := client.ServingV1().Revisions(rev.Namespace).Delete(ctx, rev.Name, metav1.DeleteOptions{}); err != nil {
+				logger.Errorw("Failed to GC revision: "+rev.Name, zap.Error(err))
+			}
+		default:
+			swap--
+			revs[i], revs[swap] = revs[swap], revs[i]
+		}
+	}
+	revs = revs[swap:] // Reslice to include the nonstale revisions, which are now in reverse order
+
+	if max == gc.Disabled || len(revs) <= max {
 		return nil
 	}
 
-	// Sort by creation timestamp descending
-	sort.Slice(revs, func(i, j int) bool {
-		return revs[j].CreationTimestamp.Before(&revs[i].CreationTimestamp)
-	})
-
-	for _, rev := range revs[gcSkipOffset:] {
-		if isRevisionStale(ctx, rev, config) {
-			err := c.ServingClientSet.ServingV1alpha1().Revisions(rev.Namespace).Delete(rev.Name, &metav1.DeleteOptions{})
-			if err != nil {
-				logger.With(zap.Error(err)).Errorf("Failed to delete stale revision %q", rev.Name)
-				continue
-			}
+	// Delete extra revisions past max.
+	logger.Infof("Maximum number of revisions (%d) reached, deleting oldest non-active (%d) revisions",
+		max, len(revs)-max)
+	for _, rev := range revs[max:] {
+		logger.Info("Deleting non-active revision: ", rev.ObjectMeta.Name)
+		if err := client.ServingV1().Revisions(rev.Namespace).Delete(ctx, rev.Name, metav1.DeleteOptions{}); err != nil {
+			logger.Errorw("Failed to GC revision: "+rev.Name, zap.Error(err))
 		}
 	}
 	return nil
 }
 
-func isRevisionStale(ctx context.Context, rev *v1alpha1.Revision, config *v1alpha1.Configuration) bool {
-	if config.Status.LatestReadyRevisionName == rev.Name {
-		return false
-	}
-
-	cfg := configns.FromContext(ctx).RevisionGC
-	logger := logging.FromContext(ctx)
-
-	curTime := time.Now()
-	if rev.ObjectMeta.CreationTimestamp.Add(cfg.StaleRevisionCreateDelay).After(curTime) {
-		// Revision was created sooner than staleRevisionCreateDelay. Ignore it.
-		return false
-	}
-
-	lastPin, err := rev.GetLastPinned()
-	if err != nil {
-		if err.(v1alpha1.LastPinnedParseError).Type != v1alpha1.AnnotationParseErrorTypeMissing {
-			logger.Errorw("Failed to determine revision last pinned", zap.Error(err))
+// nonactiveRevisions swaps keeps only non active revisions.
+func nonactiveRevisions(revs []*v1.Revision, config *v1.Configuration) []*v1.Revision {
+	swap := len(revs)
+	for i := 0; i < swap; {
+		if isRevisionActive(revs[i], config) {
+			swap--
+			revs[i] = revs[swap]
 		} else {
-			// Revision was never pinned and its RevisionConditionReady is not true after staleRevisionCreateDelay.
-			// It usually happens when ksvc was deployed with wrong configuration.
-			rc := rev.Status.GetCondition(v1beta1.RevisionConditionReady)
-			if rc == nil || rc.Status != corev1.ConditionTrue {
-				return true
-			}
+			i++
 		}
-		return false
+	}
+	return revs[:swap]
+}
+
+func isRevisionActive(rev *v1.Revision, config *v1.Configuration) bool {
+	if config.Status.LatestReadyRevisionName == rev.Name {
+		return true // never delete latest ready, even if config is not active.
 	}
 
-	ret := lastPin.Add(cfg.StaleRevisionTimeout).Before(curTime)
-	if ret {
-		logger.Infof("Detected stale revision %v with creation time %v and lastPinned time %v.", rev.ObjectMeta.Name, rev.ObjectMeta.CreationTimestamp, lastPin)
+	if strings.EqualFold(rev.Annotations[serving.RevisionPreservedAnnotationKey], "true") {
+		return true
 	}
-	return ret
+	// Anything that the labeler hasn't explicitly labelled as inactive.
+	// Revisions which do not yet have any annotation are not eligible for deletion.
+	return rev.GetRoutingState() != v1.RoutingStateReserve
+}
+
+func isRevisionStale(cfg *gc.Config, rev *v1.Revision, logger *zap.SugaredLogger) bool {
+	sinceCreate, sinceActive := cfg.RetainSinceCreateTime, cfg.RetainSinceLastActiveTime
+	if sinceCreate == gc.Disabled && sinceActive == gc.Disabled {
+		return false // Time checks are both disabled. Not stale.
+	}
+
+	createTime := rev.ObjectMeta.CreationTimestamp.Time
+	if sinceCreate != gc.Disabled && time.Since(createTime) < sinceCreate {
+		return false // Revision was created sooner than RetainSinceCreateTime. Not stale.
+	}
+
+	active := revisionLastActiveTime(rev)
+	if sinceActive != gc.Disabled && time.Since(active) < sinceActive {
+		return false // Revision was recently active. Not stale.
+	}
+
+	logger.Infof("Detected stale revision %q with creation time %v and last active time %v.",
+		rev.ObjectMeta.Name, createTime, active)
+	return true
+}
+
+// revisionLastActiveTime returns if present:
+// routingStateModified, then the created time.
+// This is used for sort-ordering by most recently active.
+func revisionLastActiveTime(rev *v1.Revision) time.Time {
+	if t := rev.GetRoutingStateModified(); !t.IsZero() {
+		return t
+	}
+	return rev.ObjectMeta.GetCreationTimestamp().Time
 }

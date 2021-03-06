@@ -20,12 +20,8 @@ import (
 	"io"
 	"net/http"
 	"sync"
-)
 
-const (
-	// Return `queue` as body for 200 responses to indicate the response is from queue-proxy.
-	aliveBody    = "queue"
-	notAliveBody = "queue not ready"
+	"knative.dev/serving/pkg/queue"
 )
 
 // State holds state about the current healthiness of the component.
@@ -38,18 +34,25 @@ type State struct {
 	drainCompleted bool
 }
 
-// IsAlive returns whether or not the health server is in a known
+// NewState returns a new State with both alive and shuttingDown set to false.
+func NewState() *State {
+	return &State{
+		drainCh: make(chan struct{}),
+	}
+}
+
+// isAlive returns whether or not the health server is in a known
 // working state currently.
-func (h *State) IsAlive() bool {
+func (h *State) isAlive() bool {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
 	return h.alive
 }
 
-// IsShuttingDown returns whether or not the health server is currently
+// isShuttingDown returns whether or not the health server is currently
 // shutting down.
-func (h *State) IsShuttingDown() bool {
+func (h *State) isShuttingDown() bool {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
@@ -79,33 +82,35 @@ func (h *State) drainFinished() {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
-	if !h.drainCompleted && h.drainCh != nil {
+	if !h.drainCompleted {
 		close(h.drainCh)
 	}
 
 	h.drainCompleted = true
-
 }
 
 // HandleHealthProbe handles the probe according to the current state of the
 // health server. If isAggressive is false and prober has succeeded previously,
-// the function return success without probing user-container again (until
+// the function returns success without probing user-container again (until
 // shutdown).
 func (h *State) HandleHealthProbe(prober func() bool, isAggressive bool, w http.ResponseWriter) {
 	sendAlive := func() {
-		io.WriteString(w, aliveBody)
+		io.WriteString(w, queue.Name)
 	}
 
 	sendNotAlive := func() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		io.WriteString(w, notAliveBody)
+	}
+
+	sendShuttingDown := func() {
+		w.WriteHeader(http.StatusGone)
 	}
 
 	switch {
-	case !isAggressive && h.IsAlive():
+	case !isAggressive && h.isAlive():
 		sendAlive()
-	case h.IsShuttingDown():
-		sendNotAlive()
+	case h.isShuttingDown():
+		sendShuttingDown()
 	case prober != nil && !prober():
 		sendNotAlive()
 	default:
@@ -116,18 +121,12 @@ func (h *State) HandleHealthProbe(prober func() bool, isAggressive bool, w http.
 
 // DrainHandlerFunc constructs an HTTP handler that waits until the proxy server is shut down.
 func (h *State) DrainHandlerFunc() func(_ http.ResponseWriter, _ *http.Request) {
-	h.mutex.Lock()
-	defer h.mutex.Unlock()
-	if h.drainCh == nil {
-		h.drainCh = make(chan struct{})
-	}
-
 	return func(_ http.ResponseWriter, _ *http.Request) {
 		<-h.drainCh
 	}
 }
 
-// Shutdown marks the proxy server as no ready and begins its shutdown process. This
+// Shutdown marks the proxy server as not ready and begins its shutdown process. This
 // results in unblocking any connections waiting for drain.
 func (h *State) Shutdown(drain func()) {
 	h.shutdown()

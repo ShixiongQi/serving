@@ -1,3 +1,19 @@
+/*
+Copyright 2020 The Knative Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package tracing
 
 import (
@@ -7,9 +23,8 @@ import (
 	"os"
 	"sync"
 
-	"contrib.go.opencensus.io/exporter/stackdriver"
 	oczipkin "contrib.go.opencensus.io/exporter/zipkin"
-	zipkin "github.com/openzipkin/zipkin-go"
+	"github.com/openzipkin/zipkin-go"
 	httpreporter "github.com/openzipkin/zipkin-go/reporter/http"
 	"go.opencensus.io/trace"
 	"go.uber.org/zap"
@@ -114,34 +129,43 @@ func createOCTConfig(cfg *config.Config) *trace.Config {
 // WithExporter returns a ConfigOption for use with NewOpenCensusTracer that configures
 // it to export traces based on the configuration read from config-tracing.
 func WithExporter(name string, logger *zap.SugaredLogger) ConfigOption {
+	return WithExporterFull(name, name, logger)
+}
+
+// WithExporterFull supports host argument for WithExporter.
+// The host arg is used for a value of tag ip="{IP}" so you can use an actual IP. Otherwise,
+// the host name must be able to be resolved.
+// e.g)
+//   "name" is a service name like activator-service.
+//   "host" is a endpoint IP like activator-service's endpoint IP.
+func WithExporterFull(name, host string, logger *zap.SugaredLogger) ConfigOption {
 	return func(cfg *config.Config) error {
 		var (
 			exporter trace.Exporter
 			closer   io.Closer
+			err      error
 		)
 		switch cfg.Backend {
 		case config.Stackdriver:
-			exp, err := stackdriver.NewExporter(stackdriver.Options{
-				ProjectID: cfg.StackdriverProjectID,
-			})
+			exporter, err = newStackdriver(cfg)
 			if err != nil {
-				logger.Errorw("error reading project-id from metadata", zap.Error(err))
 				return err
 			}
-			exporter = exp
 		case config.Zipkin:
-			// If name isn't specified, then zipkin.NewEndpoint will return an error saying that it
+			// If host isn't specified, then zipkin.NewEndpoint will return an error saying that it
 			// can't find the host named ''. So, if not specified, default it to this machine's
 			// hostname.
-			if name == "" {
+			if host == "" {
 				n, err := os.Hostname()
 				if err != nil {
-					return fmt.Errorf("unable to get hostname: %v", err)
+					return fmt.Errorf("unable to get hostname: %w", err)
 				}
-				name = n
+				host = n
 			}
-			hostPort := name + ":80"
-			zipEP, err := zipkin.NewEndpoint(name, hostPort)
+			if name == "" {
+				name = host
+			}
+			zipEP, err := zipkin.NewEndpoint(name, host)
 			if err != nil {
 				logger.Errorw("error building zipkin endpoint", zap.Error(err))
 				return err
@@ -149,6 +173,7 @@ func WithExporter(name string, logger *zap.SugaredLogger) ConfigOption {
 			reporter := httpreporter.NewReporter(cfg.ZipkinEndpoint)
 			exporter = oczipkin.NewExporter(reporter, zipEP)
 			closer = reporter
+
 		default:
 			// Disables tracing.
 		}

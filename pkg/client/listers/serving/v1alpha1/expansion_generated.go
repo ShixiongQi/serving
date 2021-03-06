@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,34 +18,10 @@ limitations under the License.
 
 package v1alpha1
 
-// ConfigurationListerExpansion allows custom methods to be added to
-// ConfigurationLister.
-type ConfigurationListerExpansion interface{}
+// DomainMappingListerExpansion allows custom methods to be added to
+// DomainMappingLister.
+type DomainMappingListerExpansion interface{}
 
-// ConfigurationNamespaceListerExpansion allows custom methods to be added to
-// ConfigurationNamespaceLister.
-type ConfigurationNamespaceListerExpansion interface{}
-
-// RevisionListerExpansion allows custom methods to be added to
-// RevisionLister.
-type RevisionListerExpansion interface{}
-
-// RevisionNamespaceListerExpansion allows custom methods to be added to
-// RevisionNamespaceLister.
-type RevisionNamespaceListerExpansion interface{}
-
-// RouteListerExpansion allows custom methods to be added to
-// RouteLister.
-type RouteListerExpansion interface{}
-
-// RouteNamespaceListerExpansion allows custom methods to be added to
-// RouteNamespaceLister.
-type RouteNamespaceListerExpansion interface{}
-
-// ServiceListerExpansion allows custom methods to be added to
-// ServiceLister.
-type ServiceListerExpansion interface{}
-
-// ServiceNamespaceListerExpansion allows custom methods to be added to
-// ServiceNamespaceLister.
-type ServiceNamespaceListerExpansion interface{}
+// DomainMappingNamespaceListerExpansion allows custom methods to be added to
+// DomainMappingNamespaceLister.
+type DomainMappingNamespaceListerExpansion interface{}

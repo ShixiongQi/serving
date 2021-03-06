@@ -15,12 +15,14 @@
 package stream
 
 import (
+	"bufio"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"hash"
 	"io"
+	"os"
 	"sync"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -39,8 +41,9 @@ var (
 
 // Layer is a streaming implementation of v1.Layer.
 type Layer struct {
-	blob     io.ReadCloser
-	consumed bool
+	blob        io.ReadCloser
+	consumed    bool
+	compression int
 
 	mu             sync.Mutex
 	digest, diffID *v1.Hash
@@ -49,8 +52,29 @@ type Layer struct {
 
 var _ v1.Layer = (*Layer)(nil)
 
+// LayerOption applies options to layer
+type LayerOption func(*Layer)
+
+// WithCompressionLevel sets the gzip compression. See `gzip.NewWriterLevel` for possible values.
+func WithCompressionLevel(level int) LayerOption {
+	return func(l *Layer) {
+		l.compression = level
+	}
+}
+
 // NewLayer creates a Layer from an io.ReadCloser.
-func NewLayer(rc io.ReadCloser) *Layer { return &Layer{blob: rc} }
+func NewLayer(rc io.ReadCloser, opts ...LayerOption) *Layer {
+	layer := &Layer{
+		blob:        rc,
+		compression: gzip.BestSpeed,
+	}
+
+	for _, opt := range opts {
+		opt(layer)
+	}
+
+	return layer
+}
 
 // Digest implements v1.Layer.
 func (l *Layer) Digest() (v1.Hash, error) {
@@ -107,6 +131,7 @@ type compressedReader struct {
 
 	h, zh hash.Hash // collects digests of compressed and uncompressed stream.
 	pr    io.Reader
+	bw    *bufio.Writer
 	count *countWriter
 
 	l *Layer // stream.Layer to update upon Close.
@@ -121,7 +146,14 @@ func newCompressedReader(l *Layer) (*compressedReader, error) {
 	// capture compressed digest, and a countWriter to capture compressed
 	// size.
 	pr, pw := io.Pipe()
-	zw, err := gzip.NewWriterLevel(io.MultiWriter(pw, zh, count), gzip.BestSpeed)
+
+	// Write compressed bytes to be read by the pipe.Reader, hashed by zh, and counted by count.
+	mw := io.MultiWriter(pw, zh, count)
+
+	// Buffer the output of the gzip writer so we don't have to wait on pr to keep writing.
+	// 64K ought to be small enough for anybody.
+	bw := bufio.NewWriterSize(mw, 2<<16)
+	zw, err := gzip.NewWriterLevel(bw, l.compression)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +161,7 @@ func newCompressedReader(l *Layer) (*compressedReader, error) {
 	cr := &compressedReader{
 		closer: newMultiCloser(zw, l.blob),
 		pr:     pr,
+		bw:     bw,
 		h:      h,
 		zh:     zh,
 		count:  count,
@@ -157,6 +190,11 @@ func (cr *compressedReader) Close() error {
 
 	// Close the inner ReadCloser.
 	if err := cr.closer.Close(); err != nil {
+		return err
+	}
+
+	// Flush the buffer.
+	if err := cr.bw.Flush(); err != nil {
 		return err
 	}
 
@@ -194,7 +232,9 @@ func newMultiCloser(c ...io.Closer) multiCloser { return multiCloser(c) }
 
 func (m multiCloser) Close() error {
 	for _, c := range m {
-		if err := c.Close(); err != nil {
+		// NOTE: net/http will call close on success, so if we've already
+		// closed the inner rc, it's not an error.
+		if err := c.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			return err
 		}
 	}

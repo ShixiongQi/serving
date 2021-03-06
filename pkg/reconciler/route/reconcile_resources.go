@@ -1,11 +1,11 @@
 /*
-Copyright 2018 The Knative Authors.
+Copyright 2018 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,83 +18,97 @@ package route
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"reflect"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"knative.dev/pkg/apis/duck"
+	"knative.dev/networking/pkg/apis/networking"
+	netv1alpha1 "knative.dev/networking/pkg/apis/networking/v1alpha1"
+	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
-	netv1alpha1 "knative.dev/serving/pkg/apis/networking/v1alpha1"
-	"knative.dev/serving/pkg/apis/serving"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/serving/pkg/reconciler/route/config"
 	"knative.dev/serving/pkg/reconciler/route/resources"
+	"knative.dev/serving/pkg/reconciler/route/resources/names"
 	"knative.dev/serving/pkg/reconciler/route/traffic"
 )
 
-func routeOwnerLabelSelector(route *v1alpha1.Route) labels.Selector {
-	return labels.Set(map[string]string{
-		serving.RouteLabelKey:          route.Name,
-		serving.RouteNamespaceLabelKey: route.Namespace,
-	}).AsSelector()
-}
-
-func (c *Reconciler) deleteIngressForRoute(route *v1alpha1.Route) error {
-
-	// We always use DeleteCollection because even with a fixed name, we apply the labels.
-	selector := routeOwnerLabelSelector(route).String()
-
-	// Delete Ingresses owned by this route.
-	return c.ServingClientSet.NetworkingV1alpha1().Ingresses(route.Namespace).DeleteCollection(
-		nil, metav1.ListOptions{LabelSelector: selector})
-}
-
 func (c *Reconciler) reconcileIngress(
-	ctx context.Context, ira IngressResourceAccessors, r *v1alpha1.Route, desired netv1alpha1.IngressAccessor) (netv1alpha1.IngressAccessor, error) {
-	ingress, err := ira.getIngressForRoute(r)
+	ctx context.Context, r *v1.Route, tc *traffic.Config,
+	tls []netv1alpha1.IngressTLS,
+	ingressClass string,
+	acmeChallenges ...netv1alpha1.HTTP01Challenge,
+) (*netv1alpha1.Ingress, *traffic.Rollout, error) {
+	recorder := controller.GetEventRecorder(ctx)
+	var effectiveRO *traffic.Rollout
+
+	ingress, err := c.ingressLister.Ingresses(r.Namespace).Get(names.Ingress(r))
 	if apierrs.IsNotFound(err) {
-		ingress, err = ira.createIngress(desired)
+		desired, err := resources.MakeIngress(ctx, r, tc, tls, ingressClass, acmeChallenges...)
 		if err != nil {
-			c.Recorder.Eventf(r, corev1.EventTypeWarning, "CreationFailed", "Failed to create Ingress: %v", err)
-			return nil, fmt.Errorf("failed to create Ingress: %w", err)
+			return nil, nil, err
+		}
+		ingress, err = c.netclient.NetworkingV1alpha1().Ingresses(desired.Namespace).Create(ctx, desired, metav1.CreateOptions{})
+		if err != nil {
+			recorder.Eventf(r, corev1.EventTypeWarning, "CreationFailed", "Failed to create Ingress: %v", err)
+			return nil, nil, fmt.Errorf("failed to create Ingress: %w", err)
 		}
 
-		c.Recorder.Eventf(r, corev1.EventTypeNormal, "Created", "Created Ingress %q", ingress.GetName())
-		return ingress, nil
+		recorder.Eventf(r, corev1.EventTypeNormal, "Created", "Created Ingress %q", ingress.GetName())
+		return ingress, tc.BuildRollout(), nil
 	} else if err != nil {
-		return nil, err
+		return nil, nil, err
 	} else {
-		// It is notable that one reason for differences here may be defaulting.
-		// When that is the case, the Update will end up being a nop because the
-		// webhook will bring them into alignment and no new reconciliation will occur.
-		if !equality.Semantic.DeepEqual(ingress.GetSpec(), desired.GetSpec()) {
-			// Don't modify the informers copy
-			origin := ingress.DeepCopyObject().(netv1alpha1.IngressAccessor)
-			origin.SetSpec(*desired.GetSpec())
+		// Ingress exists. We need to compute the rollout spec diff.
+		effectiveRO = c.reconcileRollout(ctx, r, tc, ingress)
+		desired, err := resources.MakeIngressWithRollout(ctx, r, tc, effectiveRO,
+			tls, ingressClass, acmeChallenges...)
+		if err != nil {
+			return nil, nil, err
+		}
 
-			updated, err := ira.updateIngress(origin)
+		if !equality.Semantic.DeepEqual(ingress.Spec, desired.Spec) ||
+			!equality.Semantic.DeepEqual(ingress.Annotations, desired.Annotations) ||
+			!equality.Semantic.DeepEqual(ingress.Labels, desired.Labels) {
+
+			// It is notable that one reason for differences here may be defaulting.
+			// When that is the case, the Update will end up being a nop because the
+			// webhook will bring them into alignment and no new reconciliation will occur.
+			// Also, compare annotation and label in case ingress.Class or parent route's labels
+			// is updated.
+
+			// Don't modify the informers copy.
+			origin := ingress.DeepCopy()
+			origin.Spec = desired.Spec
+			origin.Annotations = desired.Annotations
+			origin.Labels = desired.Labels
+
+			updated, err := c.netclient.NetworkingV1alpha1().Ingresses(origin.Namespace).Update(
+				ctx, origin, metav1.UpdateOptions{})
 			if err != nil {
-				return nil, fmt.Errorf("failed to update Ingress: %w", err)
+				return nil, nil, fmt.Errorf("failed to update Ingress: %w", err)
 			}
-			return updated, nil
+			return updated, effectiveRO, nil
 		}
 	}
 
-	return ingress, err
+	return ingress, effectiveRO, err
 }
 
-func (c *Reconciler) deleteServices(namespace string, serviceNames sets.String) error {
+func (c *Reconciler) deleteServices(ctx context.Context, namespace string, serviceNames sets.String) error {
 	for _, serviceName := range serviceNames.List() {
-		if err := c.KubeClientSet.CoreV1().Services(namespace).Delete(serviceName, nil); err != nil {
+		if err := c.kubeclient.CoreV1().Services(namespace).Delete(ctx, serviceName, metav1.DeleteOptions{}); err != nil {
 			return fmt.Errorf("failed to delete Service: %w", err)
 		}
 	}
@@ -102,36 +116,41 @@ func (c *Reconciler) deleteServices(namespace string, serviceNames sets.String) 
 	return nil
 }
 
-func (c *Reconciler) reconcilePlaceholderServices(ctx context.Context, route *v1alpha1.Route, targets map[string]traffic.RevisionTargets, existingServiceNames sets.String) ([]*corev1.Service, error) {
+func (c *Reconciler) reconcilePlaceholderServices(ctx context.Context, route *v1.Route, targets map[string]traffic.RevisionTargets) ([]*corev1.Service, error) {
 	logger := logging.FromContext(ctx)
-	ns := route.Namespace
+	recorder := controller.GetEventRecorder(ctx)
 
-	names := sets.NewString()
+	existingServiceNames, err := c.getPlaceholderServiceNames(route)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch existing services: %w", err)
+	}
+
+	ns := route.Namespace
+	names := make(sets.String, len(targets))
 	for name := range targets {
 		names.Insert(name)
 	}
 
-	createdServiceNames := sets.String{}
-
-	var services []*corev1.Service
+	services := make([]*corev1.Service, 0, names.Len())
+	createdServiceNames := make(sets.String, names.Len())
+	// NB: we don't need to sort here, but it makes table tests work...
 	for _, name := range names.List() {
 		desiredService, err := resources.MakeK8sPlaceholderService(ctx, route, name)
 		if err != nil {
-			logger.Warnw("Failed to construct placeholder k8s service", zap.Error(err))
-			return nil, err
+			return nil, fmt.Errorf("failed to construct placeholder k8s service: %w", err)
 		}
 
 		service, err := c.serviceLister.Services(ns).Get(desiredService.Name)
 		if apierrs.IsNotFound(err) {
 			// Doesn't exist, create it.
-			service, err = c.KubeClientSet.CoreV1().Services(ns).Create(desiredService)
+			service, err = c.kubeclient.CoreV1().Services(ns).Create(ctx, desiredService, metav1.CreateOptions{})
 			if err != nil {
-				c.Recorder.Eventf(route, corev1.EventTypeWarning, "CreationFailed",
+				recorder.Eventf(route, corev1.EventTypeWarning, "CreationFailed",
 					"Failed to create placeholder service %q: %v", desiredService.Name, err)
 				return nil, fmt.Errorf("failed to create placeholder service: %w", err)
 			}
-			logger.Infof("Created service %s", desiredService.Name)
-			c.Recorder.Eventf(route, corev1.EventTypeNormal, "Created", "Created placeholder service %q", desiredService.Name)
+			logger.Info("Created service ", desiredService.Name)
+			recorder.Eventf(route, corev1.EventTypeNormal, "Created", "Created placeholder service %q", desiredService.Name)
 		} else if err != nil {
 			return nil, err
 		} else if !metav1.IsControlledBy(service, route) {
@@ -145,7 +164,7 @@ func (c *Reconciler) reconcilePlaceholderServices(ctx context.Context, route *v1
 	}
 
 	// Delete any current services that was no longer desired.
-	if err := c.deleteServices(ns, existingServiceNames.Difference(createdServiceNames)); err != nil {
+	if err := c.deleteServices(ctx, ns, existingServiceNames.Difference(createdServiceNames)); err != nil {
 		return nil, err
 	}
 
@@ -154,28 +173,27 @@ func (c *Reconciler) reconcilePlaceholderServices(ctx context.Context, route *v1
 	return services, nil
 }
 
-func (c *Reconciler) updatePlaceholderServices(ctx context.Context, route *v1alpha1.Route, services []*corev1.Service, ingress netv1alpha1.IngressAccessor) error {
+func (c *Reconciler) updatePlaceholderServices(ctx context.Context, route *v1.Route, services []*corev1.Service, ingress *netv1alpha1.Ingress) error {
 	logger := logging.FromContext(ctx)
 	ns := route.Namespace
 
-	eg, _ := errgroup.WithContext(ctx)
+	eg, egCtx := errgroup.WithContext(ctx)
 	for _, service := range services {
 		service := service
 		eg.Go(func() error {
-			desiredService, err := resources.MakeK8sService(ctx, route, service.Name, ingress, resources.IsClusterLocalService(service))
+			desiredService, err := resources.MakeK8sService(egCtx, route, service.Name, ingress, resources.IsClusterLocalService(service), service.Spec.ClusterIP)
 			if err != nil {
 				// Loadbalancer not ready, no need to update.
-				logger.Warnf("Failed to update k8s service: %v", err)
+				logger.Warnw("Failed to update k8s service", zap.Error(err))
 				return nil
 			}
 
 			// Make sure that the service has the proper specification.
 			if !equality.Semantic.DeepEqual(service.Spec, desiredService.Spec) {
-				// Don't modify the informers copy
+				// Don't modify the informers copy.
 				existing := service.DeepCopy()
 				existing.Spec = desiredService.Spec
-				_, err = c.KubeClientSet.CoreV1().Services(ns).Update(existing)
-				if err != nil {
+				if _, err := c.kubeclient.CoreV1().Services(ns).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
 					return err
 				}
 			}
@@ -188,106 +206,76 @@ func (c *Reconciler) updatePlaceholderServices(ctx context.Context, route *v1alp
 	return eg.Wait()
 }
 
-// Update the Status of the route.  Caller is responsible for checking
-// for semantic differences before calling.
-func (c *Reconciler) updateStatus(desired *v1alpha1.Route) (*v1alpha1.Route, error) {
-	route, err := c.routeLister.Routes(desired.Namespace).Get(desired.Name)
-	if err != nil {
-		return nil, err
+func deserializeRollout(ctx context.Context, ro string) *traffic.Rollout {
+	if ro == "" {
+		return nil
 	}
-	// If there's nothing to update, just return.
-	if reflect.DeepEqual(route.Status, desired.Status) {
-		return route, nil
+	r := &traffic.Rollout{}
+	// Failure can happen if users manually tweaked the
+	// annotation or there's etcd corruption. Just log, rollouts
+	// are not mission critical.
+	if err := json.Unmarshal([]byte(ro), r); err != nil {
+		logging.FromContext(ctx).Warnw("Error deserializing Rollout: "+ro,
+			zap.Error(err))
+		return nil
 	}
-	// Don't modify the informers copy
-	existing := route.DeepCopy()
-	existing.Status = desired.Status
-	return c.ServingClientSet.ServingV1alpha1().Routes(desired.Namespace).UpdateStatus(existing)
+	if !r.Validate() {
+		logging.FromContext(ctx).Warnw("Deserializing Rollout is invalid: " + ro)
+		return nil
+	}
+	return r
 }
 
-// Update the lastPinned annotation on revisions we target so they don't get GC'd.
-func (c *Reconciler) reconcileTargetRevisions(ctx context.Context, t *traffic.Config, route *v1alpha1.Route) error {
-	gcConfig := config.FromContext(ctx).GC
-	logger := logging.FromContext(ctx)
-	lpDebounce := gcConfig.StaleRevisionLastpinnedDebounce
+func (c *Reconciler) reconcileRollout(
+	ctx context.Context, r *v1.Route, tc *traffic.Config,
+	ingress *netv1alpha1.Ingress) *traffic.Rollout {
+	cfg := config.FromContext(ctx)
 
-	eg, _ := errgroup.WithContext(ctx)
-	for _, target := range t.Targets {
-		for _, rt := range target {
-			tt := rt.TrafficTarget
-			eg.Go(func() error {
-				rev, err := c.revisionLister.Revisions(route.Namespace).Get(tt.RevisionName)
-				if apierrs.IsNotFound(err) {
-					logger.Infof("Unable to update lastPinned for missing revision %q", tt.RevisionName)
-					return nil
-				} else if err != nil {
-					return err
-				}
-
-				newRev := rev.DeepCopy()
-
-				lastPin, err := newRev.GetLastPinned()
-				if err != nil {
-					// Missing is an expected error case for a not yet pinned revision.
-					if err.(v1alpha1.LastPinnedParseError).Type != v1alpha1.AnnotationParseErrorTypeMissing {
-						return err
-					}
-				} else {
-					// Enforce a delay before performing an update on lastPinned to avoid excess churn.
-					if lastPin.Add(lpDebounce).After(c.clock.Now()) {
-						return nil
-					}
-				}
-
-				newRev.SetLastPinned(c.clock.Now())
-
-				patch, err := duck.CreateMergePatch(rev, newRev)
-				if err != nil {
-					return err
-				}
-
-				if _, err := c.ServingClientSet.ServingV1alpha1().Revisions(route.Namespace).Patch(rev.Name, types.MergePatchType, patch); err != nil {
-					return fmt.Errorf("failed to set revision annotation: %w", err)
-				}
-				return nil
-			})
-		}
+	// Is there rollout duration specified?
+	rd := int(r.RolloutDuration().Seconds())
+	if rd == 0 {
+		// If not, check if there's a cluster-wide default.
+		rd = cfg.Network.RolloutDurationSecs
 	}
-	return eg.Wait()
-}
-
-func (c *Reconciler) reconcileCertificate(ctx context.Context, r *v1alpha1.Route, desiredCert *netv1alpha1.Certificate) (*netv1alpha1.Certificate, error) {
-	cert, err := c.certificateLister.Certificates(desiredCert.Namespace).Get(desiredCert.Name)
-	if apierrs.IsNotFound(err) {
-		cert, err = c.ServingClientSet.NetworkingV1alpha1().Certificates(desiredCert.Namespace).Create(desiredCert)
-		if err != nil {
-			c.Recorder.Eventf(r, corev1.EventTypeWarning, "CreationFailed", "Failed to create Certificate: %v", err)
-			return nil, fmt.Errorf("failed to create Certificate: %w", err)
-		}
-		c.Recorder.Eventf(r, corev1.EventTypeNormal, "Created",
-			"Created Certificate %s/%s", cert.Namespace, cert.Name)
-		return cert, nil
-	} else if err != nil {
-		return nil, err
-	} else if !metav1.IsControlledBy(cert, r) {
-		// Surface an error in the route's status, and return an error.
-		r.Status.MarkCertificateNotOwned(cert.Name)
-		return nil, fmt.Errorf("route: %s does not own certificate: %s", r.Name, cert.Name)
-	} else {
-		if !equality.Semantic.DeepEqual(cert.Spec, desiredCert.Spec) {
-			// Don't modify the informers copy
-			existing := cert.DeepCopy()
-			existing.Spec = desiredCert.Spec
-			cert, err := c.ServingClientSet.NetworkingV1alpha1().Certificates(existing.Namespace).Update(existing)
-			if err != nil {
-				c.Recorder.Eventf(r, corev1.EventTypeWarning, "UpdateFailed",
-					"Failed to update Certificate %s/%s: %v", existing.Namespace, existing.Name, err)
-				return nil, err
-			}
-			c.Recorder.Eventf(existing, corev1.EventTypeNormal, "Updated",
-				"Updated Spec for Certificate %s/%s", existing.Namespace, existing.Name)
-			return cert, nil
-		}
+	curRO := tc.BuildRollout()
+	// When rollout is disabled just create the baseline annotation.
+	if rd <= 0 {
+		return curRO
 	}
-	return cert, nil
+	// Get the current rollout state as described by the traffic.
+	nextStepTime := int64(0)
+	logger := logging.FromContext(ctx).Desugar().With(
+		zap.Int("durationSecs", rd))
+	logger.Debug("Rollout is enabled. Stepping from previous state.")
+	// Get the previous rollout state from the annotation.
+	// If it's corrupt, inexistent, or otherwise incorrect,
+	// the prevRO will be just nil rollout.
+	prevRO := deserializeRollout(ctx,
+		ingress.Annotations[networking.RolloutAnnotationKey])
+
+	// And recompute the rollout state.
+	now := c.clock.Now().UnixNano()
+
+	// Now check if the ingress status changed from not ready to ready.
+	rtView := r.Status.GetCondition(v1.RouteConditionIngressReady)
+	if prevRO != nil && ingress.IsReady() && !rtView.IsTrue() {
+		logger.Debug("Observing Ingress not-ready to ready switch condition for rollout")
+		prevRO.ObserveReady(ctx, now, float64(rd))
+	}
+
+	effectiveRO, nextStepTime := curRO.Step(ctx, prevRO, now)
+	if nextStepTime > 0 {
+		nextStepTime -= now
+		c.enqueueAfter(r, time.Duration(nextStepTime))
+		logger.Debug("Re-enqueuing after", zap.Duration("nextStepTime", time.Duration(nextStepTime)))
+	}
+
+	// Comparing and diffing isn't cheap so do it only if we're going
+	// to actually log the message.
+	// Those are well known types, cmp won't panic.
+	if logger.Core().Enabled(zapcore.DebugLevel) && !cmp.Equal(prevRO, effectiveRO) {
+		logger.Debug("Rollout diff:(-was,+now)",
+			zap.String("diff", cmp.Diff(prevRO, effectiveRO)))
+	}
+	return effectiveRO
 }

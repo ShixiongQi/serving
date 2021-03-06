@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ limitations under the License.
 package client
 
 import (
-	"context"
+	context "context"
 
 	kubernetes "k8s.io/client-go/kubernetes"
 	rest "k8s.io/client-go/rest"
@@ -42,8 +42,13 @@ func withClient(ctx context.Context, cfg *rest.Config) context.Context {
 func Get(ctx context.Context) kubernetes.Interface {
 	untyped := ctx.Value(Key{})
 	if untyped == nil {
-		logging.FromContext(ctx).Panic(
-			"Unable to fetch k8s.io/client-go/kubernetes.Interface from context.")
+		if injection.GetConfig(ctx) == nil {
+			logging.FromContext(ctx).Panic(
+				"Unable to fetch k8s.io/client-go/kubernetes.Interface from context. This context is not the application context (which is typically given to constructors via sharedmain).")
+		} else {
+			logging.FromContext(ctx).Panic(
+				"Unable to fetch k8s.io/client-go/kubernetes.Interface from context.")
+		}
 	}
 	return untyped.(kubernetes.Interface)
 }

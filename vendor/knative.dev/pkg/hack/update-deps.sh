@@ -14,17 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-readonly ROOT_DIR=$(dirname $0)/..
-source ${ROOT_DIR}/vendor/knative.dev/test-infra/scripts/library.sh
-
 set -o errexit
 set -o nounset
 set -o pipefail
 
-cd ${ROOT_DIR}
+source $(dirname "$0")/../vendor/knative.dev/hack/library.sh
 
-# Ensure we have everything we need under vendor/
-dep ensure
-
-rm -rf $(find vendor/ -name 'OWNERS')
-rm -rf $(find vendor/ -name '*_test.go')
+go_update_deps "$@"

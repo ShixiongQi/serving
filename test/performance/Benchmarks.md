@@ -100,7 +100,7 @@ need to add the following:
 
 ```yaml
 - name: mako
-  image: gcr.io/knative-performance/mako-microservice:latest
+  image: gcr.io/knative-tests/test-infra/mako-microservice:latest
   env:
     - name: GOOGLE_APPLICATION_CREDENTIALS
       value: /var/secret/robot.json
@@ -158,8 +158,7 @@ For testing existing benchmarks, use
 
 ## Admins
 
-We currently have three admins for benchmarking with mako.
+We currently have two admins for benchmarking with mako.
 
-1. `[mattmoor](https://github.com/mattmoor)`
-2. `[vagababov](https://github.com/vagababov)`
-3. `[chizhg](https://github.com/chizhg)`
+1. `[vagababov](https://github.com/vagababov)`
+2. `[chizhg](https://github.com/chizhg)`

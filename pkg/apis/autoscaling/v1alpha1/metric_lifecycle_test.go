@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package v1alpha1
 
 import (
@@ -25,7 +26,7 @@ import (
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/apis/duck"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
-	apitestv1 "knative.dev/pkg/apis/testing/v1"
+	apistest "knative.dev/pkg/apis/testing"
 	"knative.dev/serving/pkg/apis/autoscaling"
 )
 
@@ -45,6 +46,14 @@ func TestMetricDuckTypes(t *testing.T) {
 				t.Errorf("VerifyType(Metric, %T) = %v", test.t, err)
 			}
 		})
+	}
+}
+
+func TestMetricGetConditionSet(t *testing.T) {
+	r := &Metric{}
+
+	if got, want := r.GetConditionSet().GetTopLevelConditionType(), apis.ConditionReady; got != want {
+		t.Errorf("GetTopLevelConditionType=%v, want=%v", got, want)
 	}
 }
 
@@ -115,8 +124,15 @@ func TestMetricIsReady(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if e, a := tc.isReady, tc.status.IsReady(); e != a {
+			m := Metric{Status: tc.status}
+			if e, a := tc.isReady, m.IsReady(); e != a {
 				t.Errorf("Ready = %v, want: %v", a, e)
+			}
+
+			m.Generation = 1
+			m.Status.ObservedGeneration = 2
+			if m.IsReady() {
+				t.Error("Expected IsReady() to be false when Generation != ObservedGeneration")
 			}
 		})
 	}
@@ -133,33 +149,33 @@ func TestMetricGetSetCondition(t *testing.T) {
 	}
 	ms.MarkMetricReady()
 	if diff := cmp.Diff(mc, ms.GetCondition(MetricConditionReady), cmpopts.IgnoreFields(apis.Condition{}, "LastTransitionTime")); diff != "" {
-		t.Errorf("GetCondition refs diff (-want +got): %v", diff)
+		t.Error("GetCondition refs diff (-want +got):", diff)
 	}
 }
 
 func TestTypicalFlowWithMetricCondition(t *testing.T) {
 	m := &MetricStatus{}
 	m.InitializeConditions()
-	apitestv1.CheckConditionOngoing(m.duck(), MetricConditionReady, t)
+	apistest.CheckConditionOngoing(m, MetricConditionReady, t)
 
 	const (
 		wantReason  = "reason"
 		wantMessage = "the error message"
 	)
 	m.MarkMetricFailed(wantReason, wantMessage)
-	apitestv1.CheckConditionFailed(m.duck(), MetricConditionReady, t)
+	apistest.CheckConditionFailed(m, MetricConditionReady, t)
 	if got := m.GetCondition(MetricConditionReady); got == nil || got.Reason != wantReason || got.Message != wantMessage {
 		t.Errorf("MarkMetricFailed = %v, wantReason %v, wantMessage %v", got, wantReason, wantMessage)
 	}
 
 	m.MarkMetricNotReady(wantReason, wantMessage)
-	apitestv1.CheckConditionOngoing(m.duck(), MetricConditionReady, t)
+	apistest.CheckConditionOngoing(m, MetricConditionReady, t)
 	if got := m.GetCondition(MetricConditionReady); got == nil || got.Reason != wantReason || got.Message != wantMessage {
 		t.Errorf("MarkMetricNotReady = %v, wantReason %v, wantMessage %v", got, wantReason, wantMessage)
 	}
 
 	m.MarkMetricReady()
-	apitestv1.CheckConditionSucceeded(m.duck(), MetricConditionReady, t)
+	apistest.CheckConditionSucceeded(m, MetricConditionReady, t)
 }
 
 func TestMetricGetGroupVersionKind(t *testing.T) {

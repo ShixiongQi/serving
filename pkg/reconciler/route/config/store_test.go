@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,12 +19,12 @@ package config
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
+	network "knative.dev/networking/pkg"
 	logtesting "knative.dev/pkg/logging/testing"
+	cfgmap "knative.dev/serving/pkg/apis/config"
 	"knative.dev/serving/pkg/gc"
-	"knative.dev/serving/pkg/network"
 
 	. "knative.dev/pkg/configmap/testing"
 )
@@ -36,40 +36,45 @@ func TestStoreLoadWithContext(t *testing.T) {
 	domainConfig := ConfigMapFromTestFile(t, DomainConfigName)
 	gcConfig := ConfigMapFromTestFile(t, gc.ConfigName)
 	networkConfig := ConfigMapFromTestFile(t, network.ConfigName)
+	featureConfig := ConfigMapFromTestFile(t, cfgmap.FeaturesConfigName)
 
 	store.OnConfigChanged(domainConfig)
 	store.OnConfigChanged(gcConfig)
 	store.OnConfigChanged(networkConfig)
+	store.OnConfigChanged(featureConfig)
 
 	config := FromContext(store.ToContext(context.Background()))
 
 	t.Run("domain", func(t *testing.T) {
 		expected, _ := NewDomainFromConfigMap(domainConfig)
 		if diff := cmp.Diff(expected, config.Domain); diff != "" {
-			t.Errorf("Unexpected controller config (-want, +got): %v", diff)
+			t.Error("Unexpected controller config (-want, +got):", diff)
 		}
 	})
 
 	t.Run("gc", func(t *testing.T) {
 		expected, err := gc.NewConfigFromConfigMapFunc(ctx)(gcConfig)
 		if err != nil {
-			t.Errorf("Parsing configmap: %v", err)
+			t.Error("Parsing configmap:", err)
 		}
 		if diff := cmp.Diff(expected, config.GC); diff != "" {
-			t.Errorf("Unexpected controller config (-want, +got): %v", diff)
+			t.Error("Unexpected controller config (-want, +got):", diff)
 		}
 	})
+}
 
-	t.Run("gc invalid timeout", func(t *testing.T) {
-		gcConfig.Data["stale-revision-timeout"] = "1h"
-		expected, err := gc.NewConfigFromConfigMapFunc(ctx)(gcConfig)
+func TestStoreLoadWithContextOrDefaults(t *testing.T) {
+	store := NewStore(logtesting.TestContextWithLogger(t))
+	store.OnConfigChanged(ConfigMapFromTestFile(t, DomainConfigName))
+	store.OnConfigChanged(ConfigMapFromTestFile(t, network.ConfigName))
+	store.OnConfigChanged(ConfigMapFromTestFile(t, gc.ConfigName))
 
-		if err != nil {
-			t.Errorf("Got error parsing gc config with invalid timeout: %v", err)
-		}
+	config := FromContextOrDefaults(store.ToContext(context.Background()))
 
-		if expected.StaleRevisionTimeout != 15*time.Hour {
-			t.Errorf("Expected revision timeout of %v, got %v", 15*time.Hour, expected.StaleRevisionTimeout)
+	t.Run("domain", func(t *testing.T) {
+		expected, _ := cfgmap.NewFeaturesConfigFromMap(map[string]string{})
+		if diff := cmp.Diff(expected, config.Features); diff != "" {
+			t.Error("Unexpected controller config (-want, +got):", diff)
 		}
 	})
 }
@@ -79,6 +84,7 @@ func TestStoreImmutableConfig(t *testing.T) {
 	store.OnConfigChanged(ConfigMapFromTestFile(t, DomainConfigName))
 	store.OnConfigChanged(ConfigMapFromTestFile(t, network.ConfigName))
 	store.OnConfigChanged(ConfigMapFromTestFile(t, gc.ConfigName))
+	store.OnConfigChanged(ConfigMapFromTestFile(t, cfgmap.FeaturesConfigName))
 
 	config := store.Load()
 

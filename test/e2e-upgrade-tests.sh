@@ -28,77 +28,31 @@
 # You can specify the version to run against with the --version argument
 # (e.g. --version v0.7.0). If this argument is not specified, the script will
 # run against the latest tagged version on the current branch.
-
-source $(dirname $0)/e2e-common.sh
-
-# Latest serving release. If user does not supply this as a flag, the latest
-# tagged release on the current branch will be used.
-LATEST_SERVING_RELEASE_VERSION=$(git describe --match "v[0-9]*" --abbrev=0)
-
-function install_latest_release() {
-  header "Installing Knative latest public release"
-  local url="https://github.com/knative/serving/releases/download/${LATEST_SERVING_RELEASE_VERSION}"
-  # TODO: should this test install istio and build at all, or only serving?
-  install_knative_serving \
-    "${url}/serving.yaml" \
-    || fail_test "Knative latest release installation failed"
-  wait_until_pods_running knative-serving
-}
-
-function install_head() {
-  header "Installing Knative head release"
-  install_knative_serving || fail_test "Knative head release installation failed"
-  wait_until_pods_running knative-serving
-}
-
-function knative_setup() {
-  # Build Knative to generate Istio manifests from HEAD for install_latest_release
-  # We do it here because it's a one-time setup
-  build_knative_from_source
-  install_latest_release
-}
+# shellcheck disable=SC1090
+source "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 # Script entry point.
 
-initialize $@ --skip-istio-addon
+# Skip installing istio as an add-on.
+# Temporarily increasing the cluster size for serving tests to rule out
+# resource/eviction as causes of flakiness.
+initialize "$@" --skip-istio-addon --min-nodes=4 --max-nodes=4
+
+# We haven't configured these deployments for high-availability,
+# so disable the chaos duck.
+# TODO(mattmoor): Reconsider this after 0.17 cuts.
+disable_chaosduck
 
 # TODO(#2656): Reduce the timeout after we get this test to consistently passing.
-TIMEOUT=10m
+TIMEOUT=30m
 
-header "Running preupgrade tests"
+header "Running upgrade tests"
 
-go_test_e2e -tags=preupgrade -timeout=${TIMEOUT} ./test/upgrade \
-  --resolvabledomain=$(use_resolvable_domain) "$(use_https)" || fail_test
+go_test_e2e -tags=upgrade -timeout=${TIMEOUT} \
+  ./test/upgrade \
+  --resolvabledomain=$(use_resolvable_domain) || fail_test
 
-header "Starting prober test"
-
-# Remove this in case we failed to clean it up in an earlier test.
-rm -f /tmp/prober-signal
-
-go_test_e2e -tags=probe -timeout=${TIMEOUT} ./test/upgrade \
-  --resolvabledomain=$(use_resolvable_domain) "$(use_https)" &
-PROBER_PID=$!
-echo "Prober PID is ${PROBER_PID}"
-
-install_head
-
-header "Running postupgrade tests"
-go_test_e2e -tags=postupgrade -timeout=${TIMEOUT} ./test/upgrade \
-  --resolvabledomain=$(use_resolvable_domain) "$(use_https)" || fail_test
-
-install_latest_release
-
-header "Running postdowngrade tests"
-go_test_e2e -tags=postdowngrade -timeout=${TIMEOUT} ./test/upgrade \
-  --resolvabledomain=$(use_resolvable_domain) "$(use_https)" || fail_test
-
-# The prober is blocking on /tmp/prober-signal to know when it should exit.
-#
-# This is kind of gross. First attempt was to just send a signal to the go test,
-# but "go test" intercepts the signal and always exits with a non-zero code.
-echo "done" > /tmp/prober-signal
-
-header "Waiting for prober test"
-wait ${PROBER_PID} || fail_test "Prober failed"
-
+# Remove the kail log file if the test flow passes.
+# This is for preventing too many large log files to be uploaded to GCS in CI.
+rm "${ARTIFACTS}/k8s.log-$(basename "${E2E_SCRIPT}").txt"
 success

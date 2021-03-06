@@ -19,12 +19,14 @@ limitations under the License.
 package v1
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"regexp"
 	"testing"
 
-	pkgTest "knative.dev/pkg/test"
+	pkgtest "knative.dev/pkg/test"
+	"knative.dev/pkg/test/spoof"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	rtesting "knative.dev/serving/pkg/testing/v1"
 	"knative.dev/serving/test"
@@ -83,7 +85,7 @@ func canServeRequests(t *testing.T, clients *test.Clients, route *v1.Route) erro
 		route.Name,
 		func(r *v1.Route) (bool, error) {
 			url = r.Status.URL.URL()
-			return url != nil, nil
+			return url.String() != "", nil
 		},
 		"RouteDomain",
 	)
@@ -92,13 +94,15 @@ func canServeRequests(t *testing.T, clients *test.Clients, route *v1.Route) erro
 	}
 
 	t.Logf("Route %s can serve the expected data at %s", route.Name, url)
-	_, err = pkgTest.WaitForEndpointState(
+	_, err = pkgtest.WaitForEndpointState(
+		context.Background(),
 		clients.KubeClient,
 		t.Logf,
 		url,
-		v1test.RetryingRouteInconsistency(pkgTest.MatchesAllOf(pkgTest.IsStatusOK, pkgTest.MatchesBody(test.HelloWorldText))),
+		v1test.RetryingRouteInconsistency(spoof.MatchesAllOf(spoof.IsStatusOK, spoof.MatchesBody(test.HelloWorldText))),
 		"WaitForEndpointToServeText",
-		test.ServingFlags.ResolvableDomain)
+		test.ServingFlags.ResolvableDomain,
+		test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS))
 	if err != nil {
 		return fmt.Errorf("the endpoint for Route %s at %s didn't serve the expected text %q: %w", route.Name, url, test.HelloWorldText, err)
 	}
@@ -119,11 +123,10 @@ func TestServiceGenerateName(t *testing.T) {
 	}
 
 	// Cleanup on test failure.
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
-	defer func() { test.TearDown(clients, names) }()
+	test.EnsureTearDown(t, clients, &names)
 
 	// Create the service using the generate name field. If the service does not become ready this will fail.
-	t.Logf("Creating new service with generateName %s", generateName)
+	t.Log("Creating new service with generateName", generateName)
 	resources, err := v1test.CreateServiceReady(t, clients, &names, setServiceGenerateName(generateName))
 	if err != nil {
 		t.Fatalf("Failed to create service with generateName %s: %v", generateName, err)
@@ -155,10 +158,9 @@ func TestRouteAndConfigGenerateName(t *testing.T) {
 		Image: test.HelloWorld,
 	}
 
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
-	defer func() { test.TearDown(clients, names) }()
+	test.EnsureTearDown(t, clients, &names)
 
-	t.Logf("Creating new configuration with generateName %s", generateName)
+	t.Log("Creating new configuration with generateName", generateName)
 	config, err := v1test.CreateConfiguration(t, clients, names, setConfigurationGenerateName(generateName))
 	if err != nil {
 		t.Fatalf("Failed to create configuration with generateName %s: %v", generateName, err)
@@ -167,7 +169,7 @@ func TestRouteAndConfigGenerateName(t *testing.T) {
 
 	// Ensure the associated revision is created. This also checks that the configuration becomes ready.
 	t.Log("The configuration will be updated with the name of the associated Revision once it is created.")
-	names.Revision, err = v1test.WaitForConfigLatestRevision(clients, names)
+	names.Revision, err = v1test.WaitForConfigLatestUnpinnedRevision(clients, names)
 	if err != nil {
 		t.Fatalf("Configuration %s was not updated with the new revision: %v", names.Config, err)
 	}
@@ -179,7 +181,7 @@ func TestRouteAndConfigGenerateName(t *testing.T) {
 	}
 
 	// Create a route that maps to the revision created by the configuration above
-	t.Logf("Create new Route with generateName %s", generateName)
+	t.Log("Create new Route with generateName", generateName)
 	route, err := v1test.CreateRoute(t, clients, names, setRouteGenerateName(generateName))
 	if err != nil {
 		t.Fatalf("Failed to create route with generateName %s: %v", generateName, err)

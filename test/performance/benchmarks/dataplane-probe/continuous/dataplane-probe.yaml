@@ -17,21 +17,6 @@ kind: ServiceAccount
 metadata:
   name: prober
 ---
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: prober
-rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.internal.knative.dev"]
-    resources: ["serverlessservices"]
-    verbs: ["get", "list", "watch"]
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -42,7 +27,7 @@ subjects:
     namespace: default
 roleRef:
   kind: ClusterRole
-  name: prober
+  name: cluster-admin
   apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: batch/v1beta1
@@ -59,7 +44,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=deployment", "--duration=3m"]
             resources:
               requests:
@@ -69,7 +54,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -102,7 +87,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=istio", "--duration=3m"]
             resources:
               requests:
@@ -112,7 +97,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -144,7 +129,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=queue", "--duration=3m"]
             resources:
               requests:
@@ -154,7 +139,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -186,7 +171,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=activator", "--duration=3m"]
             resources:
               requests:
@@ -196,7 +181,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -228,7 +213,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=activator-with-cc", "--duration=3m"]
             resources:
               requests:
@@ -238,7 +223,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -270,7 +255,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=queue-with-cc", "--duration=3m"]
             resources:
               requests:
@@ -280,7 +265,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -312,7 +297,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=queue-with-cc-10", "--duration=3m"]
             resources:
               requests:
@@ -322,7 +307,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -354,7 +339,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=queue-with-cc-1", "--duration=3m"]
             resources:
               requests:
@@ -364,7 +349,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -396,7 +381,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=activator-with-cc-10", "--duration=3m"]
             resources:
               requests:
@@ -406,7 +391,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json
@@ -438,7 +423,7 @@ spec:
           serviceAccountName: prober
           containers:
           - name: dataplane-probe
-            image: knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
+            image: ko://knative.dev/serving/test/performance/benchmarks/dataplane-probe/continuous
             args: ["-target=activator-with-cc-1", "--duration=3m"]
             resources:
               requests:
@@ -448,7 +433,7 @@ spec:
             - name: config-mako
               mountPath: /etc/config-mako
           - name: mako
-            image: gcr.io/knative-performance/mako-microservice:latest
+            image: gcr.io/knative-tests/test-infra/mako-microservice:latest
             env:
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: /var/secret/robot.json

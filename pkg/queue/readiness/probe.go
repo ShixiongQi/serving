@@ -17,8 +17,11 @@ limitations under the License.
 package readiness
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -37,13 +40,51 @@ const (
 // Probe wraps a corev1.Probe along with a count of consecutive, successful probes
 type Probe struct {
 	*corev1.Probe
-	count int32
+	count       int32
+	pollTimeout time.Duration   // To make tests not run for 10 seconds.
+	out         io.Writer       // To make tests not log errors in good cases.
+	ctx         context.Context // To enable feature flags support.
+
+	// Barrier sync to ensure only one probe is happening at the same time.
+	// When a probe is active `gv` will be non-nil.
+	// When the probe finishes the `gv` will be reset to nil.
+	mu sync.RWMutex
+	gv *gateValue
+}
+
+// gateValue is a write-once boolean impl.
+type gateValue struct {
+	broadcast chan struct{}
+	result    bool
+}
+
+// newGV returns a gateValue which is ready to write.
+func newGV() *gateValue {
+	return &gateValue{
+		broadcast: make(chan struct{}),
+	}
+}
+
+// only `writer` must call `write` to set the value.
+// `write` will panic if called more than once.
+func (gv *gateValue) write(val bool) {
+	gv.result = val
+	close(gv.broadcast)
+}
+
+// `read` can be called multiple times.
+func (gv *gateValue) read() bool {
+	<-gv.broadcast
+	return gv.result
 }
 
 // NewProbe returns a pointer a new Probe
-func NewProbe(v1p *corev1.Probe) *Probe {
+func NewProbe(ctx context.Context, v1p *corev1.Probe) *Probe {
 	return &Probe{
-		Probe: v1p,
+		Probe:       v1p,
+		pollTimeout: PollTimeout,
+		out:         os.Stderr,
+		ctx:         ctx,
 	}
 }
 
@@ -54,6 +95,29 @@ func (p *Probe) IsAggressive() bool {
 
 // ProbeContainer executes the defined Probe against the user-container
 func (p *Probe) ProbeContainer() bool {
+	gv, writer := func() (*gateValue, bool) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		// If gateValue exists (i.e. right now something is probing, attach to that probe).
+		if p.gv != nil {
+			return p.gv, false
+		}
+		p.gv = newGV()
+		return p.gv, true
+	}()
+
+	if writer {
+		res := p.probeContainerImpl()
+		gv.write(res)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.gv = nil
+		return res
+	}
+	return gv.read()
+}
+
+func (p *Probe) probeContainerImpl() bool {
 	var err error
 
 	switch {
@@ -65,40 +129,53 @@ func (p *Probe) ProbeContainer() bool {
 		// Should never be reachable. Exec probes to be translated to
 		// TCP probes when container is built.
 		// Using Fprintf for a concise error message in the event log.
-		fmt.Fprintln(os.Stderr, "exec probe not supported")
+		fmt.Fprintln(p.out, "exec probe not supported")
 		return false
 	default:
 		// Using Fprintf for a concise error message in the event log.
-		fmt.Fprintln(os.Stderr, "no probe found")
+		fmt.Fprintln(p.out, "no probe found")
 		return false
 	}
 
 	if err != nil {
 		// Using Fprintf for a concise error message in the event log.
-		fmt.Fprint(os.Stderr, err.Error())
+		fmt.Fprintln(p.out, err.Error())
 		return false
 	}
 	return true
 }
 
 func (p *Probe) doProbe(probe func(time.Duration) error) error {
-	if p.IsAggressive() {
-		return wait.PollImmediate(retryInterval, PollTimeout, func() (bool, error) {
-			if tcpErr := probe(aggressiveProbeTimeout); tcpErr != nil {
-				// reset count of consecutive successes to zero
-				p.count = 0
-				return false, nil
-			}
-
-			p.count++
-
-			// return success if count of consecutive successes is equal to or greater
-			// than the probe's SuccessThreshold.
-			return p.Count() >= p.SuccessThreshold, nil
-		})
+	if !p.IsAggressive() {
+		return probe(time.Duration(p.TimeoutSeconds) * time.Second)
 	}
 
-	return probe(time.Duration(p.TimeoutSeconds) * time.Second)
+	var failCount int
+	var lastProbeErr error
+	pollErr := wait.PollImmediate(retryInterval, p.pollTimeout, func() (bool, error) {
+		if err := probe(aggressiveProbeTimeout); err != nil {
+			// Reset count of consecutive successes to zero.
+			p.count = 0
+			// Don't log this now since we probe every 50ms and some failures are
+			// expected if the user container takes longer than that to start up.
+			// We'll log the lastProbeErr if we don't eventually succeed.
+			lastProbeErr = err
+			failCount++
+			return false, nil
+		}
+
+		p.count++
+
+		// Return success if count of consecutive successes is equal to or greater
+		// than the probe's SuccessThreshold.
+		return p.count >= p.SuccessThreshold, nil
+	})
+
+	if pollErr != nil && lastProbeErr != nil {
+		fmt.Fprintf(p.out, "aggressive probe error (failed %d times): %v\n", failCount, lastProbeErr)
+	}
+
+	return pollErr
 }
 
 // tcpProbe function executes TCP probe once if its standard probe
@@ -125,11 +202,6 @@ func (p *Probe) httpProbe() error {
 
 	return p.doProbe(func(to time.Duration) error {
 		config.Timeout = to
-		return health.HTTPProbe(config)
+		return health.HTTPProbe(p.ctx, config)
 	})
-}
-
-// Count function fetches current probe count
-func (p *Probe) Count() int32 {
-	return p.count
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors.
+Copyright 2019 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,38 +19,46 @@ package configuration
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/client-go/tools/cache"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	configurationinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/configuration"
-	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision"
-	"knative.dev/serving/pkg/reconciler"
+	"knative.dev/pkg/logging"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	servingclient "knative.dev/serving/pkg/client/injection/client"
+	configurationinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/configuration"
+	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
+	configreconciler "knative.dev/serving/pkg/client/injection/reconciler/serving/v1/configuration"
+	"knative.dev/serving/pkg/reconciler/configuration/config"
 )
-
-const controllerAgentName = "configuration-controller"
 
 // NewController creates a new Configuration controller
 func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
 ) *controller.Impl {
-
+	logger := logging.FromContext(ctx)
 	configurationInformer := configurationinformer.Get(ctx)
 	revisionInformer := revisioninformer.Get(ctx)
 
-	c := &Reconciler{
-		Base:                reconciler.NewBase(ctx, controllerAgentName, cmw),
-		configurationLister: configurationInformer.Lister(),
-		revisionLister:      revisionInformer.Lister(),
-	}
-	impl := controller.NewImpl(c, c.Logger, "Configurations")
+	logger.Info("Setting up ConfigMap receivers")
+	configStore := config.NewStore(logger.Named("config-store"))
+	configStore.WatchConfigs(cmw)
 
-	c.Logger.Info("Setting up event handlers")
+	c := &Reconciler{
+		client:         servingclient.Get(ctx),
+		revisionLister: revisionInformer.Lister(),
+		clock:          &clock.RealClock{},
+	}
+	impl := configreconciler.NewImpl(ctx, c, func(*controller.Impl) controller.Options {
+		return controller.Options{ConfigStore: configStore}
+	})
+
+	logger.Info("Setting up event handlers")
 	configurationInformer.Informer().AddEventHandler(controller.HandleAll(impl.Enqueue))
 
 	revisionInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
-		FilterFunc: controller.Filter(v1alpha1.SchemeGroupVersion.WithKind("Configuration")),
+		FilterFunc: controller.FilterController(&v1.Configuration{}),
 		Handler:    controller.HandleAll(impl.EnqueueControllerOf),
 	})
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,8 +26,10 @@ import (
 )
 
 // ConfigurationLister helps list Configurations.
+// All objects returned here must be treated as read-only.
 type ConfigurationLister interface {
 	// List lists all Configurations in the indexer.
+	// Objects returned here must be treated as read-only.
 	List(selector labels.Selector) (ret []*v1.Configuration, err error)
 	// Configurations returns an object that can list and get Configurations.
 	Configurations(namespace string) ConfigurationNamespaceLister
@@ -58,10 +60,13 @@ func (s *configurationLister) Configurations(namespace string) ConfigurationName
 }
 
 // ConfigurationNamespaceLister helps list and get Configurations.
+// All objects returned here must be treated as read-only.
 type ConfigurationNamespaceLister interface {
 	// List lists all Configurations in the indexer for a given namespace.
+	// Objects returned here must be treated as read-only.
 	List(selector labels.Selector) (ret []*v1.Configuration, err error)
 	// Get retrieves the Configuration from the indexer for a given namespace and name.
+	// Objects returned here must be treated as read-only.
 	Get(name string) (*v1.Configuration, error)
 	ConfigurationNamespaceListerExpansion
 }

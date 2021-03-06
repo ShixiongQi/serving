@@ -28,12 +28,20 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	pkgTest "knative.dev/pkg/test"
+	pkgtest "knative.dev/pkg/test"
+	"knative.dev/pkg/test/spoof"
 	"knative.dev/serving/test"
 	v1test "knative.dev/serving/test/v1"
 
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	rtesting "knative.dev/serving/pkg/testing/v1"
 )
+
+func withContainerConcurrency(cc int64) rtesting.ServiceOption {
+	return func(svc *v1.Service) {
+		svc.Spec.Template.Spec.ContainerConcurrency = &cc
+	}
+}
 
 func TestSingleConcurrency(t *testing.T) {
 	t.Parallel()
@@ -43,41 +51,45 @@ func TestSingleConcurrency(t *testing.T) {
 		Service: test.ObjectNameForTest(t),
 		Image:   test.SingleThreadedImage,
 	}
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
-	defer test.TearDown(clients, names)
+	test.EnsureTearDown(t, clients, &names)
 
-	objects, err := v1test.CreateServiceReady(t, clients, &names, rtesting.WithContainerConcurrency(1))
+	objects, err := v1test.CreateServiceReady(t, clients, &names, withContainerConcurrency(1))
 	if err != nil {
-		t.Fatalf("Failed to create Service: %v", err)
+		t.Fatal("Failed to create Service:", err)
 	}
 	url := objects.Service.Status.URL.URL()
 
 	// Ready does not actually mean Ready for a Route just yet.
-	// See https://knative.dev/serving/issues/1582
-	t.Logf("Probing %s", url)
-	if _, err := pkgTest.WaitForEndpointState(
+	// See https://github.com/knative/serving/issues/1582
+	t.Log("Probing", url)
+	if _, err := pkgtest.WaitForEndpointState(
+		context.Background(),
 		clients.KubeClient,
 		t.Logf,
 		url,
-		v1test.RetryingRouteInconsistency(pkgTest.IsStatusOK),
+		v1test.RetryingRouteInconsistency(spoof.IsStatusOK),
 		"WaitForSuccessfulResponse",
-		test.ServingFlags.ResolvableDomain); err != nil {
+		test.ServingFlags.ResolvableDomain,
+		test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS)); err != nil {
 		t.Fatalf("Error probing %s: %v", url, err)
 	}
 
-	client, err := pkgTest.NewSpoofingClient(clients.KubeClient, t.Logf, url.Hostname(), test.ServingFlags.ResolvableDomain)
+	client, err := pkgtest.NewSpoofingClient(context.Background(), clients.KubeClient, t.Logf, url.Hostname(),
+		test.ServingFlags.ResolvableDomain, test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS))
 	if err != nil {
-		t.Fatalf("Error creating spoofing client: %v", err)
+		t.Fatal("Error creating spoofing client:", err)
 	}
 
 	concurrency := 5
 	duration := 20 * time.Second
 	t.Logf("Maintaining %d concurrent requests for %v.", concurrency, duration)
-	group, _ := errgroup.WithContext(context.Background())
+	group, egCtx := errgroup.WithContext(context.Background())
 	for i := 0; i < concurrency; i++ {
+		threadIdx := i
 		group.Go(func() error {
+			requestIdx := 0
 			done := time.After(duration)
-			req, err := http.NewRequest(http.MethodGet, url.String(), nil)
+			req, err := http.NewRequestWithContext(egCtx, http.MethodGet, url.String(), nil)
 			if err != nil {
 				return fmt.Errorf("error creating http request: %w", err)
 			}
@@ -88,13 +100,14 @@ func TestSingleConcurrency(t *testing.T) {
 					return nil
 				default:
 					res, err := client.Do(req)
+					requestIdx++
 					if err != nil {
-						return fmt.Errorf("error making request %w", err)
+						return fmt.Errorf("error making request, thread index: %d, request index: %d: %w", threadIdx, requestIdx, err)
 					}
 					if res.StatusCode == http.StatusInternalServerError {
 						return errors.New("detected concurrent requests")
 					} else if res.StatusCode != http.StatusOK {
-						return fmt.Errorf("non 200 response %v", res.StatusCode)
+						return fmt.Errorf("non 200 response, thread index: %d, request index: %d, response %s", threadIdx, requestIdx, res)
 					}
 				}
 			}

@@ -22,61 +22,86 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"knative.dev/pkg/test/logging"
-	v1 "knative.dev/serving/pkg/apis/serving/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-
-	ptest "knative.dev/pkg/test"
+	"knative.dev/pkg/apis/duck"
+	"knative.dev/pkg/reconciler"
+	pkgTest "knative.dev/pkg/test"
+	"knative.dev/pkg/test/logging"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	rtesting "knative.dev/serving/pkg/testing/v1"
 	"knative.dev/serving/test"
 )
 
 // CreateConfiguration create a configuration resource in namespace with the name names.Config
 // that uses the image specified by names.Image.
-func CreateConfiguration(t *testing.T, clients *test.Clients, names test.ResourceNames, fopt ...rtesting.ConfigOption) (*v1.Configuration, error) {
+func CreateConfiguration(t testing.TB, clients *test.Clients, names test.ResourceNames, fopt ...rtesting.ConfigOption) (cfg *v1.Configuration, err error) {
 	config := Configuration(names, fopt...)
+	test.AddTestAnnotation(t, config.ObjectMeta)
 	LogResourceObject(t, ResourceObjects{Config: config})
-	return clients.ServingClient.Configs.Create(config)
+	return cfg, reconciler.RetryTestErrors(func(int) (err error) {
+		cfg, err = clients.ServingClient.Configs.Create(context.Background(), config, metav1.CreateOptions{})
+		return err
+	})
 }
 
 // PatchConfig patches the existing configuration passed in with the applied mutations.
 // Returns the latest configuration object
-func PatchConfig(t *testing.T, clients *test.Clients, svc *v1.Configuration, fopt ...rtesting.ConfigOption) (*v1.Configuration, error) {
-	newSvc := svc.DeepCopy()
+func PatchConfig(t testing.TB, clients *test.Clients, config *v1.Configuration, fopt ...rtesting.ConfigOption) (cfg *v1.Configuration, err error) {
+	newConfig := config.DeepCopy()
 	for _, opt := range fopt {
-		opt(newSvc)
+		opt(newConfig)
 	}
-	LogResourceObject(t, ResourceObjects{Config: newSvc})
-	patchBytes, err := test.CreateBytePatch(svc, newSvc)
+	LogResourceObject(t, ResourceObjects{Config: newConfig})
+	patchBytes, err := duck.CreateBytePatch(config, newConfig)
 	if err != nil {
 		return nil, err
 	}
-	return clients.ServingClient.Configs.Patch(svc.ObjectMeta.Name, types.JSONPatchType, patchBytes, "")
+	return cfg, reconciler.RetryTestErrors(func(int) (err error) {
+		cfg, err = clients.ServingClient.Configs.Patch(context.Background(), config.ObjectMeta.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+		return err
+	})
+}
+
+// WaitForConfigLatestPinnedRevision enables the check for pinned revision in WaitForConfigLatestRevision.
+func WaitForConfigLatestPinnedRevision(clients *test.Clients, names test.ResourceNames) (string, error) {
+	return WaitForConfigLatestRevision(clients, names, true /*wait for pinned revision*/)
+}
+
+// WaitForConfigLatestUnpinnedRevision disables the check for pinned revision in WaitForConfigLatestRevision.
+func WaitForConfigLatestUnpinnedRevision(clients *test.Clients, names test.ResourceNames) (string, error) {
+	return WaitForConfigLatestRevision(clients, names, false /*wait for unpinned revision*/)
 }
 
 // WaitForConfigLatestRevision takes a revision in through names and compares it to the current state of LatestCreatedRevisionName in Configuration.
 // Once an update is detected in the LatestCreatedRevisionName, the function waits for the created revision to be set in LatestReadyRevisionName
 // before returning the name of the revision.
-func WaitForConfigLatestRevision(clients *test.Clients, names test.ResourceNames) (string, error) {
+// Make sure to enable ensurePinned flag if the revision has an associated Route.
+func WaitForConfigLatestRevision(clients *test.Clients, names test.ResourceNames, ensurePinned bool) (string, error) {
 	var revisionName string
 	err := WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
 		if c.Status.LatestCreatedRevisionName != names.Revision {
 			revisionName = c.Status.LatestCreatedRevisionName
+			if ensurePinned {
+				// Without this it might happen that the latest created revision is later overridden by a newer one
+				// that is pinned and the following check for LatestReadyRevisionName would fail.
+				return CheckRevisionState(clients.ServingClient, revisionName, IsRevisionRoutingActive) == nil, nil
+			}
 			return true, nil
 		}
 		return false, nil
 	}, "ConfigurationUpdatedWithRevision")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("LatestCreatedRevisionName not updated: %w", err)
 	}
-	err = WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
+	if err = WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
 		return (c.Status.LatestReadyRevisionName == revisionName), nil
-	}, "ConfigurationReadyWithRevision")
+	}, "ConfigurationReadyWithRevision"); err != nil {
+		return "", fmt.Errorf("LatestReadyRevisionName not updated with %s: %w", revisionName, err)
+	}
 
-	return revisionName, err
+	return revisionName, nil
 }
 
 // ConfigurationSpec returns the spec of a configuration to be used throughout different
@@ -88,6 +113,13 @@ func ConfigurationSpec(imagePath string) *v1.ConfigurationSpec {
 				PodSpec: corev1.PodSpec{
 					Containers: []corev1.Container{{
 						Image: imagePath,
+						// Kubernetes default pull policy is IfNotPresent unless
+						// the :latest tag (== no tag) is used, in which case it
+						// is Always.  To support e2e testing on KinD, we want to
+						// explicitly disable image pulls when present because we
+						// side-load the test images onto all nodes and never push
+						// them to a registry.
+						ImagePullPolicy: corev1.PullIfNotPresent,
 					}},
 				},
 			},
@@ -102,7 +134,7 @@ func Configuration(names test.ResourceNames, fopt ...rtesting.ConfigOption) *v1.
 		ObjectMeta: metav1.ObjectMeta{
 			Name: names.Config,
 		},
-		Spec: *ConfigurationSpec(ptest.ImagePath(names.Image)),
+		Spec: *ConfigurationSpec(pkgTest.ImagePath(names.Image)),
 	}
 
 	for _, opt := range fopt {
@@ -122,8 +154,10 @@ func WaitForConfigurationState(client *test.ServingClients, name string, inState
 
 	var lastState *v1.Configuration
 	waitErr := wait.PollImmediate(test.PollInterval, test.PollTimeout, func() (bool, error) {
-		var err error
-		lastState, err = client.Configs.Get(name, metav1.GetOptions{})
+		err := reconciler.RetryTestErrors(func(int) (err error) {
+			lastState, err = client.Configs.Get(context.Background(), name, metav1.GetOptions{})
+			return err
+		})
 		if err != nil {
 			return true, err
 		}
@@ -140,7 +174,11 @@ func WaitForConfigurationState(client *test.ServingClients, name string, inState
 // is in a particular state by calling `inState` and expecting `true`.
 // This is the non-polling variety of WaitForConfigurationState
 func CheckConfigurationState(client *test.ServingClients, name string, inState func(r *v1.Configuration) (bool, error)) error {
-	c, err := client.Configs.Get(name, metav1.GetOptions{})
+	var c *v1.Configuration
+	err := reconciler.RetryTestErrors(func(int) (err error) {
+		c, err = client.Configs.Get(context.Background(), name, metav1.GetOptions{})
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -150,4 +188,10 @@ func CheckConfigurationState(client *test.ServingClients, name string, inState f
 		return fmt.Errorf("configuration %q is not in desired state, got: %+v", name, c)
 	}
 	return nil
+}
+
+// IsConfigurationReady will check the status conditions of the config and return true if the config is
+// ready. This means it has at least created one revision and that has become ready.
+func IsConfigurationReady(c *v1.Configuration) (bool, error) {
+	return c.IsReady(), nil
 }

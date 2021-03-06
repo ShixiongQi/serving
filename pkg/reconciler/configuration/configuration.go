@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Knative Authors.
+Copyright 2018 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,129 +19,60 @@ package configuration
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"sort"
 	"strconv"
 
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/apimachinery/pkg/util/clock"
+
 	"knative.dev/pkg/controller"
+	"knative.dev/pkg/kmp"
 	"knative.dev/pkg/logging"
+	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/apis/serving/v1beta1"
-	listers "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
-	"knative.dev/serving/pkg/reconciler"
+	clientset "knative.dev/serving/pkg/client/clientset/versioned"
+	configreconciler "knative.dev/serving/pkg/client/injection/reconciler/serving/v1/configuration"
+	listers "knative.dev/serving/pkg/client/listers/serving/v1"
 	"knative.dev/serving/pkg/reconciler/configuration/resources"
 )
 
 // Reconciler implements controller.Reconciler for Configuration resources.
 type Reconciler struct {
-	*reconciler.Base
+	client clientset.Interface
 
 	// listers index properties about resources
-	configurationLister listers.ConfigurationLister
-	revisionLister      listers.RevisionLister
+	revisionLister listers.RevisionLister
+
+	clock clock.PassiveClock
 }
 
-// Check that our Reconciler implements controller.Reconciler
-var _ controller.Reconciler = (*Reconciler)(nil)
+// Check that our Reconciler implements configreconciler.Interface
+var _ configreconciler.Interface = (*Reconciler)(nil)
 
-// Reconcile compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Configuration
-// resource with the current status of the resource.
-func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
+// ReconcileKind implements Interface.ReconcileKind.
+func (c *Reconciler) ReconcileKind(ctx context.Context, config *v1.Configuration) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
-
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		logger.Errorw("Invalid resource key", zap.Error(err))
-		return nil
-	}
-
-	// Get the Configuration resource with this namespace/name.
-	original, err := c.configurationLister.Configurations(namespace).Get(name)
-	if errors.IsNotFound(err) {
-		// The resource no longer exists, in which case we stop processing.
-		logger.Error("Configuration in work queue no longer exists")
-		return nil
-	} else if err != nil {
-		return err
-	}
-
-	// Don't modify the informer's copy.
-	config := original.DeepCopy()
-
-	// Reconcile this copy of the configuration and then write back any status
-	// updates regardless of whether the reconciliation errored out.
-	reconcileErr := c.reconcile(ctx, config)
-	if equality.Semantic.DeepEqual(original.Status, config.Status) {
-		// If we didn't change anything then don't call updateStatus.
-		// This is important because the copy we loaded from the informer's
-		// cache may be stale and we don't want to overwrite a prior update
-		// to status with this stale state.
-	} else if _, err = c.updateStatus(config); err != nil {
-		logger.Warnw("Failed to update configuration status", zap.Error(err))
-		c.Recorder.Eventf(config, corev1.EventTypeWarning, "UpdateFailed", "Failed to update status: %v", err)
-		return err
-	}
-	if reconcileErr != nil {
-		c.Recorder.Event(config, corev1.EventTypeWarning, "InternalError", reconcileErr.Error())
-		return reconcileErr
-	}
-	// TODO(mattmoor): Remove this after 0.7 cuts.
-	// If the spec has changed, then assume we need an upgrade and issue a patch to trigger
-	// the webhook to upgrade via defaulting.  Status updates do not trigger this due to the
-	// use of the /status resource.
-	if !equality.Semantic.DeepEqual(original.Spec, config.Spec) {
-		configurations := v1alpha1.SchemeGroupVersion.WithResource("configurations")
-		if err := c.MarkNeedsUpgrade(configurations, config.Namespace, config.Name); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Reconciler) reconcile(ctx context.Context, config *v1alpha1.Configuration) error {
-	logger := logging.FromContext(ctx)
-	if config.GetDeletionTimestamp() != nil {
-		return nil
-	}
-
-	// We may be reading a version of the object that was stored at an older version
-	// and may not have had all of the assumed defaults specified.  This won't result
-	// in this getting written back to the API Server, but lets downstream logic make
-	// assumptions about defaulting.
-	config.SetDefaults(v1.WithUpgradeViaDefaulting(ctx))
-	config.Status.InitializeConditions()
-
-	if err := config.ConvertUp(ctx, &v1beta1.Configuration{}); err != nil {
-		if ce, ok := err.(*v1alpha1.CannotConvertError); ok {
-			config.Status.MarkResourceNotConvertible(ce)
-		}
-		return err
-	}
-
-	// Bump observed generation to denote that we have processed this
-	// generation regardless of success or failure.
-	config.Status.ObservedGeneration = config.Generation
+	recorder := controller.GetEventRecorder(ctx)
 
 	// First, fetch the revision that should exist for the current generation.
-	lcr, err := c.latestCreatedRevision(config)
+	lcr, err := c.latestCreatedRevision(ctx, config)
 	if errors.IsNotFound(err) {
 		lcr, err = c.createRevision(ctx, config)
-		if err != nil {
-			c.Recorder.Eventf(config, corev1.EventTypeWarning, "CreationFailed", "Failed to create Revision: %v", err)
-
-			// Mark the Configuration as not-Ready since creating
-			// its latest revision failed.
+		if errors.IsAlreadyExists(err) {
+			// Newer revisions with a consistent naming scheme can theoretically hit this
+			// path during normal operation so we don't actually report any failures to
+			// the user.
+			// We fail reconciliation anyway to make sure we get the correct revision for
+			// further processing.
+			return fmt.Errorf("failed to create Revision: %w", err)
+		} else if err != nil {
+			recorder.Eventf(config, corev1.EventTypeWarning, "CreationFailed", "Failed to create Revision: %v", err)
 			config.Status.MarkRevisionCreationFailed(err.Error())
 
 			return fmt.Errorf("failed to create Revision: %w", err)
@@ -163,48 +94,52 @@ func (c *Reconciler) reconcile(ctx context.Context, config *v1alpha1.Configurati
 
 	// Last, determine whether we should set LatestReadyRevisionName to our
 	// LatestCreatedRevision based on its readiness.
-	rc := lcr.Status.GetCondition(v1alpha1.RevisionConditionReady)
+	rc := lcr.Status.GetCondition(v1.RevisionConditionReady)
 	switch {
-	case rc == nil || rc.Status == corev1.ConditionUnknown:
+	case rc.IsUnknown():
 		logger.Infof("Revision %q of configuration is not ready", revName)
 
-	case rc.Status == corev1.ConditionTrue:
+	case rc.IsTrue():
 		logger.Infof("Revision %q of configuration is ready", revName)
 		if config.Status.LatestReadyRevisionName == "" {
 			// Surface an event for the first revision becoming ready.
-			c.Recorder.Event(config, corev1.EventTypeNormal, "ConfigurationReady",
+			recorder.Event(config, corev1.EventTypeNormal, "ConfigurationReady",
 				"Configuration becomes ready")
 		}
 
-	case rc.Status == corev1.ConditionFalse:
-		logger.Infof("Revision %q of configuration has failed", revName)
-		// TODO(mattmoor): Only emit the event the first time we see this.
-		config.Status.MarkLatestCreatedFailed(lcr.Name, rc.Message)
-		c.Recorder.Eventf(config, corev1.EventTypeWarning, "LatestCreatedFailed",
-			"Latest created revision %q has failed", lcr.Name)
+	case rc.IsFalse():
+		logger.Infof("Revision %q of configuration has failed: Reason=%s Message=%q", revName, rc.Reason, rc.Message)
+		beforeReady := config.Status.GetCondition(v1.ConfigurationConditionReady)
+		config.Status.MarkLatestCreatedFailed(lcr.Name, rc.GetMessage())
+
+		if !equality.Semantic.DeepEqual(beforeReady, config.Status.GetCondition(v1.ConfigurationConditionReady)) {
+			recorder.Eventf(config, corev1.EventTypeWarning, "LatestCreatedFailed",
+				"Latest created revision %q has failed", lcr.Name)
+		}
 
 	default:
 		return fmt.Errorf("unrecognized condition status: %v on revision %q", rc.Status, revName)
 	}
 
-	if err = c.findAndSetLatestReadyRevision(config); err != nil {
+	if err = c.findAndSetLatestReadyRevision(ctx, config); err != nil {
 		return fmt.Errorf("failed to find and set latest ready revision: %w", err)
 	}
 	return nil
 }
 
 // findAndSetLatestReadyRevision finds the last ready revision and sets LatestReadyRevisionName to it.
-func (c *Reconciler) findAndSetLatestReadyRevision(config *v1alpha1.Configuration) error {
-	sortedRevisions, err := c.getSortedCreatedRevisions(config)
+func (c *Reconciler) findAndSetLatestReadyRevision(ctx context.Context, config *v1.Configuration) error {
+	sortedRevisions, err := c.getSortedCreatedRevisions(ctx, config)
 	if err != nil {
 		return err
 	}
 	for _, rev := range sortedRevisions {
-		if rev.Status.IsReady() {
+		if rev.IsReady() {
 			old, new := config.Status.LatestReadyRevisionName, rev.Name
 			config.Status.SetLatestReadyRevisionName(rev.Name)
 			if old != new {
-				c.Recorder.Eventf(config, corev1.EventTypeNormal, "LatestReadyUpdate",
+				controller.GetEventRecorder(ctx).Eventf(
+					config, corev1.EventTypeNormal, "LatestReadyUpdate",
 					"LatestReadyRevisionName updated to %q", rev.Name)
 			}
 			return nil
@@ -215,33 +150,38 @@ func (c *Reconciler) findAndSetLatestReadyRevision(config *v1alpha1.Configuratio
 
 // getSortedCreatedRevisions returns the list of created revisions sorted in descending
 // generation order between the generation of the latest ready revision and config's generation (both inclusive).
-func (c *Reconciler) getSortedCreatedRevisions(config *v1alpha1.Configuration) ([]*v1alpha1.Revision, error) {
+func (c *Reconciler) getSortedCreatedRevisions(ctx context.Context, config *v1.Configuration) ([]*v1.Revision, error) {
+	logger := logging.FromContext(ctx)
 	lister := c.revisionLister.Revisions(config.Namespace)
-	configSelector := labels.SelectorFromSet(map[string]string{
+	configSelector := labels.SelectorFromSet(labels.Set{
 		serving.ConfigurationLabelKey: config.Name,
 	})
 	if config.Status.LatestReadyRevisionName != "" {
 		lrr, err := lister.Get(config.Status.LatestReadyRevisionName)
+		// Record the error and continue because we still want to set the LRR to the correct revision.
 		if err != nil {
-			return nil, err
-		}
-		start := lrr.Generation
-		var generations []string
-		for i := start; i <= int64(config.Generation); i++ {
-			generations = append(generations, strconv.FormatInt(i, 10))
-		}
+			// If the user deletes the LatestReadyRevision then this may return an error due to the
+			// dangling reference.  Proceed to calculate the next-latest ready revision so that the
+			// caller can synthesize a new Revision at the current generation to replace the one deleted.
+			logger.Errorf("Error getting latest ready revision %q: %v", config.Status.LatestReadyRevisionName, err)
+		} else {
+			start := lrr.Generation
+			var generations []string
+			for i := start; i <= config.Generation; i++ {
+				generations = append(generations, strconv.FormatInt(i, 10))
+			}
 
-		// Add an "In" filter so that the configurations we get back from List have generation
-		// in range (config's latest ready generation, config's generation]
-		generationKey := serving.ConfigurationGenerationLabelKey
-		inReq, err := labels.NewRequirement(generationKey,
-			selection.In,
-			generations,
-		)
-		if err != nil {
-			return nil, err
+			// Add an "In" filter so that the configurations we get back from List have generation
+			// in range (config's latest ready generation, config's generation]
+			generationKey := serving.ConfigurationGenerationLabelKey
+			inReq, err := labels.NewRequirement(generationKey,
+				selection.In,
+				generations,
+			)
+			if err == nil {
+				configSelector = configSelector.Add(*inReq)
+			}
 		}
-		configSelector = configSelector.Add(*inReq)
 	}
 
 	list, err := lister.List(configSelector)
@@ -271,14 +211,15 @@ func (c *Reconciler) getSortedCreatedRevisions(config *v1alpha1.Configuration) (
 
 // CheckNameAvailability checks that if the named Revision specified by the Configuration
 // is available (not found), exists (but matches), or exists with conflict (doesn't match).
-func CheckNameAvailability(config *v1alpha1.Configuration, lister listers.RevisionLister) (*v1alpha1.Revision, error) {
+func CheckNameAvailability(ctx context.Context, config *v1.Configuration, lister listers.RevisionLister) (*v1.Revision, error) {
 	// If config.Spec.GetTemplate().Name is set, then we can directly look up
 	// the revision by name.
+	logger := logging.FromContext(ctx)
 	name := config.Spec.GetTemplate().Name
 	if name == "" {
 		return nil, nil
 	}
-	errConflict := errors.NewAlreadyExists(v1alpha1.Resource("revisions"), name)
+	errConflict := errors.NewAlreadyExists(v1.Resource("revisions"), name)
 
 	rev, err := lister.Revisions(config.Namespace).Get(name)
 	if errors.IsNotFound(err) {
@@ -290,6 +231,7 @@ func CheckNameAvailability(config *v1alpha1.Configuration, lister listers.Revisi
 	} else if !metav1.IsControlledBy(rev, config) {
 		// If the revision isn't controller by this configuration, then
 		// do not use it.
+		logger.Debugf("Revision %s is not controlled by Configuration %s, actual owner: %#v", rev.GetName(), config.GetName(), rev.GetOwnerReferences())
 		return nil, errConflict
 	}
 
@@ -302,20 +244,27 @@ func CheckNameAvailability(config *v1alpha1.Configuration, lister listers.Revisi
 	// We only require spec equality because the rest is immutable and the user may have
 	// annotated or labeled the Revision (beyond what the Configuration might have).
 	if !equality.Semantic.DeepEqual(config.Spec.GetTemplate().Spec, rev.Spec) {
+		diff, err := kmp.SafeDiff(config.Spec.GetTemplate().Spec, rev.Spec)
+		if err != nil {
+			logger.Errorf("Fail to Diff Revision %s spec and its Configration's spec template %v", rev.GetName(), err)
+		}
+		logger.Debugf("Revision %s spec not equal to Configuration's spec template, diff: %s", rev.GetName(), diff)
 		return nil, errConflict
 	}
 	return rev, nil
 }
 
-func (c *Reconciler) latestCreatedRevision(config *v1alpha1.Configuration) (*v1alpha1.Revision, error) {
-	if rev, err := CheckNameAvailability(config, c.revisionLister); rev != nil || err != nil {
+func (c *Reconciler) latestCreatedRevision(ctx context.Context, config *v1.Configuration) (*v1.Revision, error) {
+	if rev, err := CheckNameAvailability(ctx, config, c.revisionLister); rev != nil || err != nil {
 		return rev, err
 	}
 
 	lister := c.revisionLister.Revisions(config.Namespace)
-	generationKey := serving.ConfigurationGenerationLabelKey
 
-	list, err := lister.List(labels.SelectorFromSet(map[string]string{
+	// Even though we now name revisions consistently and could fetch by name, we have to
+	// keep this code to stay functional for older revisions that predate that change.
+	generationKey := serving.ConfigurationGenerationLabelKey
+	list, err := lister.List(labels.SelectorFromSet(labels.Set{
 		generationKey:                 resources.RevisionLabelValueForKey(generationKey, config),
 		serving.ConfigurationLabelKey: config.Name,
 	}))
@@ -324,34 +273,19 @@ func (c *Reconciler) latestCreatedRevision(config *v1alpha1.Configuration) (*v1a
 		return list[0], nil
 	}
 
-	return nil, errors.NewNotFound(v1alpha1.Resource("revisions"), fmt.Sprintf("revision for %s", config.Name))
+	return nil, errors.NewNotFound(v1.Resource("revisions"), "revision for "+config.Name)
 }
 
-func (c *Reconciler) createRevision(ctx context.Context, config *v1alpha1.Configuration) (*v1alpha1.Revision, error) {
+func (c *Reconciler) createRevision(ctx context.Context, config *v1.Configuration) (*v1.Revision, error) {
 	logger := logging.FromContext(ctx)
 
-	rev := resources.MakeRevision(config)
-	created, err := c.ServingClientSet.ServingV1alpha1().Revisions(config.Namespace).Create(rev)
+	rev := resources.MakeRevision(ctx, config, c.clock.Now())
+	created, err := c.client.ServingV1().Revisions(config.Namespace).Create(ctx, rev, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err
 	}
-	c.Recorder.Eventf(config, corev1.EventTypeNormal, "Created", "Created Revision %q", created.Name)
+	controller.GetEventRecorder(ctx).Eventf(config, corev1.EventTypeNormal, "Created", "Created Revision %q", created.Name)
 	logger.Infof("Created Revision: %#v", created)
 
 	return created, nil
-}
-
-func (c *Reconciler) updateStatus(desired *v1alpha1.Configuration) (*v1alpha1.Configuration, error) {
-	config, err := c.configurationLister.Configurations(desired.Namespace).Get(desired.Name)
-	if err != nil {
-		return nil, err
-	}
-	// If there's nothing to update, just return.
-	if reflect.DeepEqual(config.Status, desired.Status) {
-		return config, nil
-	}
-	// Don't modify the informers copy
-	existing := config.DeepCopy()
-	existing.Status = desired.Status
-	return c.ServingClientSet.ServingV1alpha1().Configurations(desired.Namespace).UpdateStatus(existing)
 }

@@ -19,8 +19,26 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"strings"
 )
+
+// The set of query string keys that we expect to send as part of the registry
+// protocol. Anything else is potentially dangerous to leak, as it's probably
+// from a redirect. These redirects often included tokens or signed URLs.
+var paramAllowlist = map[string]struct{}{
+	// Token exchange
+	"scope":   {},
+	"service": {},
+	// Cross-repo mounting
+	"mount": {},
+	"from":  {},
+	// Layer PUT
+	"digest": {},
+	// Listing tags and catalog
+	"n":    {},
+	"last": {},
+}
 
 // Error implements error to support the following error specification:
 // https://github.com/docker/distribution/blob/master/docs/spec/api.md#errors
@@ -30,6 +48,8 @@ type Error struct {
 	StatusCode int
 	// The raw body if we couldn't understand it.
 	rawBody string
+	// The request that failed.
+	request *http.Request
 }
 
 // Check that Error implements error
@@ -37,12 +57,23 @@ var _ error = (*Error)(nil)
 
 // Error implements error
 func (e *Error) Error() string {
+	prefix := ""
+	if e.request != nil {
+		prefix = fmt.Sprintf("%s %s: ", e.request.Method, redactURL(e.request.URL))
+	}
+	return prefix + e.responseErr()
+}
+
+func (e *Error) responseErr() string {
 	switch len(e.Errors) {
 	case 0:
 		if len(e.rawBody) == 0 {
-			return fmt.Sprintf("unsupported status code %d", e.StatusCode)
+			if e.request != nil && e.request.Method == http.MethodHead {
+				return fmt.Sprintf("unexpected status code %d %s (HEAD responses have no body, use GET for details)", e.StatusCode, http.StatusText(e.StatusCode))
+			}
+			return fmt.Sprintf("unexpected status code %d %s", e.StatusCode, http.StatusText(e.StatusCode))
 		}
-		return fmt.Sprintf("unsupported status code %d; body: %s", e.StatusCode, e.rawBody)
+		return fmt.Sprintf("unexpected status code %d %s: %s", e.StatusCode, http.StatusText(e.StatusCode), e.rawBody)
 	case 1:
 		return e.Errors[0].String()
 	default:
@@ -51,22 +82,38 @@ func (e *Error) Error() string {
 			errors = append(errors, d.String())
 		}
 		return fmt.Sprintf("multiple errors returned: %s",
-			strings.Join(errors, ";"))
+			strings.Join(errors, "; "))
 	}
 }
 
 // Temporary returns whether the request that preceded the error is temporary.
 func (e *Error) Temporary() bool {
 	if len(e.Errors) == 0 {
-		return false
+		_, ok := temporaryStatusCodes[e.StatusCode]
+		return ok
 	}
 	for _, d := range e.Errors {
-		// TODO: Include other error types.
-		if d.Code != BlobUploadInvalidErrorCode {
+		if _, ok := temporaryErrorCodes[d.Code]; !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// TODO(jonjohnsonjr): Consider moving to pkg/internal/redact.
+func redactURL(original *url.URL) *url.URL {
+	qs := original.Query()
+	for k, v := range qs {
+		for i := range v {
+			if _, ok := paramAllowlist[k]; !ok {
+				// key is not in the Allowlist
+				v[i] = "REDACTED"
+			}
+		}
+	}
+	redacted := *original
+	redacted.RawQuery = qs.Encode()
+	return &redacted
 }
 
 // Diagnostic represents a single error returned by a Docker registry interaction.
@@ -106,7 +153,20 @@ const (
 	UnauthorizedErrorCode        ErrorCode = "UNAUTHORIZED"
 	DeniedErrorCode              ErrorCode = "DENIED"
 	UnsupportedErrorCode         ErrorCode = "UNSUPPORTED"
+	TooManyRequestsErrorCode     ErrorCode = "TOOMANYREQUESTS"
 )
+
+// TODO: Include other error types.
+var temporaryErrorCodes = map[ErrorCode]struct{}{
+	BlobUploadInvalidErrorCode: {},
+	TooManyRequestsErrorCode:   {},
+}
+
+var temporaryStatusCodes = map[int]struct{}{
+	http.StatusInternalServerError: {},
+	http.StatusBadGateway:          {},
+	http.StatusServiceUnavailable:  {},
+}
 
 // CheckError returns a structured error if the response status is not in codes.
 func CheckError(resp *http.Response, codes ...int) error {
@@ -123,9 +183,14 @@ func CheckError(resp *http.Response, codes ...int) error {
 
 	// https://github.com/docker/distribution/blob/master/docs/spec/api.md#errors
 	structuredError := &Error{}
-	if err := json.Unmarshal(b, structuredError); err != nil {
-		structuredError.rawBody = string(b)
-	}
+
+	// This can fail if e.g. the response body is not valid JSON. That's fine,
+	// we'll construct an appropriate error string from the body and status code.
+	_ = json.Unmarshal(b, structuredError)
+
+	structuredError.rawBody = string(b)
 	structuredError.StatusCode = resp.StatusCode
+	structuredError.request = resp.Request
+
 	return structuredError
 }

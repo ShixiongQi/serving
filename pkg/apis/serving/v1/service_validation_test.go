@@ -23,12 +23,11 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	network "knative.dev/networking/pkg"
+	"knative.dev/pkg/apis"
 	"knative.dev/pkg/ptr"
 	"knative.dev/serving/pkg/apis/config"
 	"knative.dev/serving/pkg/apis/serving"
-	routeconfig "knative.dev/serving/pkg/reconciler/route/config"
-
-	"knative.dev/pkg/apis"
 )
 
 func TestServiceValidation(t *testing.T) {
@@ -51,9 +50,9 @@ func TestServiceValidation(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		r    *Service
-		want *apis.FieldError
+		name    string
+		r       *Service
+		wantErr *apis.FieldError
 	}{{
 		name: "valid run latest",
 		r: &Service{
@@ -70,14 +69,13 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: nil,
 	}, {
 		name: "valid visibility label",
 		r: &Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "valid",
 				Labels: map[string]string{
-					routeconfig.VisibilityLabelKey: "cluster-local",
+					network.VisibilityLabelKey: "cluster-local",
 				},
 			},
 			Spec: ServiceSpec{
@@ -85,22 +83,6 @@ func TestServiceValidation(t *testing.T) {
 				RouteSpec:         goodRouteSpec,
 			},
 		},
-		want: nil,
-	}, {
-		name: "invalid knative label",
-		r: &Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "valid",
-				Labels: map[string]string{
-					"serving.knative.dev/name": "some-value",
-				},
-			},
-			Spec: ServiceSpec{
-				ConfigurationSpec: goodConfigSpec,
-				RouteSpec:         goodRouteSpec,
-			},
-		},
-		want: apis.ErrInvalidKeyName("serving.knative.dev/name", "metadata.labels"),
 	}, {
 		name: "valid non knative label",
 		r: &Service{
@@ -115,14 +97,13 @@ func TestServiceValidation(t *testing.T) {
 				RouteSpec:         goodRouteSpec,
 			},
 		},
-		want: nil,
 	}, {
 		name: "invalid visibility label value",
 		r: &Service{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "valid",
 				Labels: map[string]string{
-					routeconfig.VisibilityLabelKey: "bad-label",
+					network.VisibilityLabelKey: "bad-label",
 				},
 			},
 			Spec: ServiceSpec{
@@ -130,7 +111,7 @@ func TestServiceValidation(t *testing.T) {
 				RouteSpec:         goodRouteSpec,
 			},
 		},
-		want: apis.ErrInvalidValue("bad-label", "metadata.labels.serving.knative.dev/visibility"),
+		wantErr: apis.ErrInvalidValue("bad-label", "metadata.labels."+network.VisibilityLabelKey),
 	}, {
 		name: "valid release",
 		r: &Service{
@@ -158,7 +139,6 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: nil,
 	}, {
 		name: "invalid configurationName",
 		r: &Service{
@@ -176,7 +156,7 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: apis.ErrDisallowedFields("spec.traffic[0].configurationName"),
+		wantErr: apis.ErrDisallowedFields("spec.traffic[0].configurationName"),
 	}, {
 		name: "invalid latestRevision",
 		r: &Service{
@@ -194,7 +174,7 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: apis.ErrGeneric(`may not set revisionName "valid" when latestRevision is true`, "spec.traffic[0].latestRevision"),
+		wantErr: apis.ErrGeneric(`may not set revisionName "valid" when latestRevision is true`, "spec.traffic[0].latestRevision"),
 	}, {
 		name: "invalid container concurrency",
 		r: &Service{
@@ -222,9 +202,91 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: apis.ErrOutOfBoundsValue(
+		wantErr: apis.ErrOutOfBoundsValue(
 			-10, 0, config.DefaultMaxRevisionContainerConcurrency,
 			"spec.template.spec.containerConcurrency"),
+	}, {
+		name: "invalid rollout duration",
+		r: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "rollout-duration-annotation",
+				Annotations: map[string]string{
+					serving.RolloutDurationKey: "CLXXXIIIs", // 183s.
+				},
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: RevisionTemplateSpec{
+						Spec: RevisionSpec{
+							PodSpec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Image: "hellworld",
+								}},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						LatestRevision: ptr.Bool(true),
+						Percent:        ptr.Int64(100),
+					}},
+				},
+			},
+		},
+		wantErr: apis.ErrInvalidValue("CLXXXIIIs", serving.RolloutDurationKey).ViaField("metadata.annotations"),
+	}, {
+		name: "invalid autoscaling.knative.dev annotation",
+		r: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "autoscaling-annotation",
+				Annotations: map[string]string{
+					"autoscaling.knative.dev/foo": "bar",
+				},
+			},
+			Spec: getServiceSpec("helloworld:foo"),
+		},
+		wantErr: apis.ErrInvalidKeyName("autoscaling.knative.dev/foo", "metadata.annotations", `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`),
+	}, {
+		// We want to be able to introduce new labels with the serving prefix in the future
+		// and not break downgrading.
+		name: "allow unknown uses of knative.dev/serving prefix for labels",
+		r: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+				Labels: map[string]string{
+					"serving.knative.dev/testlabel": "value",
+				},
+			},
+			Spec: getServiceSpec("helloworld:foo"),
+		},
+		wantErr: nil,
+	}, {
+		// We want to be able to introduce new annotations with the serving prefix in the future
+		// and not break downgrading.
+		name: "allow unknown uses of serving.knative.dev prefix for annotations",
+		r: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "serving-annotation",
+				Annotations: map[string]string{
+					"serving.knative.dev/foo": "bar",
+				},
+			},
+			Spec: getServiceSpec("helloworld:foo"),
+		},
+		wantErr: nil,
+	}, {
+		name: "invalid name",
+		r: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "",
+			},
+			Spec: getServiceSpec("helloworld:foo"),
+		},
+		wantErr: &apis.FieldError{
+			Message: "name or generateName is required",
+			Paths:   []string{"metadata.name"},
+		},
 	}}
 
 	// TODO(dangerd): PodSpec validation failures.
@@ -233,9 +295,9 @@ func TestServiceValidation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.r.Validate(context.Background())
-			if !cmp.Equal(test.want.Error(), got.Error()) {
+			if !cmp.Equal(test.wantErr.Error(), got.Error()) {
 				t.Errorf("Validate (-want, +got) = %v",
-					cmp.Diff(test.want.Error(), got.Error()))
+					cmp.Diff(test.wantErr.Error(), got.Error()))
 			}
 		})
 	}
@@ -553,50 +615,6 @@ func TestServiceSubresourceUpdate(t *testing.T) {
 		subresource: "status",
 		want:        nil,
 	}, {
-		name: "status update with invalid status",
-		service: &Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "valid",
-			},
-			Spec: ServiceSpec{
-				ConfigurationSpec: ConfigurationSpec{
-					Template: RevisionTemplateSpec{
-						Spec: RevisionSpec{
-							PodSpec: corev1.PodSpec{
-								Containers: []corev1.Container{{
-									Image: "helloworld:foo",
-								}},
-							},
-							TimeoutSeconds: ptr.Int64(config.DefaultMaxRevisionTimeoutSeconds + 1),
-						},
-					},
-				},
-				RouteSpec: RouteSpec{
-					Traffic: []TrafficTarget{{
-						LatestRevision: ptr.Bool(true),
-						Percent:        ptr.Int64(100),
-					}},
-				},
-			},
-			Status: ServiceStatus{
-				RouteStatusFields: RouteStatusFields{
-					Traffic: []TrafficTarget{{
-						Tag:          "bar",
-						RevisionName: "foo",
-						Percent:      ptr.Int64(50), URL: &apis.URL{
-							Scheme: "http",
-							Host:   "foo.bar.com",
-						},
-					}},
-				},
-			},
-		},
-		subresource: "status",
-		want: &apis.FieldError{
-			Message: "Traffic targets sum to 50, want 100",
-			Paths:   []string{"status.traffic"},
-		},
-	}, {
 		name: "non-status sub resource update with valid revision template",
 		service: &Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -664,7 +682,7 @@ func TestServiceSubresourceUpdate(t *testing.T) {
 			ctx = apis.WithinUpdate(ctx, test.service)
 			ctx = apis.WithinSubResourceUpdate(ctx, test.service, test.subresource)
 			if diff := cmp.Diff(test.want.Error(), test.service.Validate(ctx).Error()); diff != "" {
-				t.Errorf("Validate (-want, +got) = %v", diff)
+				t.Error("Validate (-want, +got) =", diff)
 			}
 		})
 	}
@@ -780,7 +798,7 @@ func TestServiceAnnotationUpdate(t *testing.T) {
 			ctx := context.Background()
 			ctx = apis.WithinUpdate(ctx, test.prev)
 			if diff := cmp.Diff(test.want.Error(), test.this.Validate(ctx).Error()); diff != "" {
-				t.Errorf("Validate (-want, +got) = %v", diff)
+				t.Error("Validate (-want, +got) =", diff)
 			}
 		})
 	}

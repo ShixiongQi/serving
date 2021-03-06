@@ -21,20 +21,17 @@ import (
 
 	autoscalingv2beta1 "k8s.io/api/autoscaling/v2beta1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/ptr"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
-	servingv1alpha1 "knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/autoscaler"
-	aresources "knative.dev/serving/pkg/reconciler/autoscaling/resources"
+	"knative.dev/serving/pkg/autoscaler/config/autoscalerconfig"
 )
 
 // MakeHPA creates an HPA resource from a PA resource.
-func MakeHPA(pa *v1alpha1.PodAutoscaler, config *autoscaler.Config) *autoscalingv2beta1.HorizontalPodAutoscaler {
-	min, max := pa.ScaleBounds()
+func MakeHPA(pa *v1alpha1.PodAutoscaler, config *autoscalerconfig.Config) *autoscalingv2beta1.HorizontalPodAutoscaler {
+	min, max := pa.ScaleBounds(config)
 	if max == 0 {
 		max = math.MaxInt32 // default to no limit
 	}
@@ -59,8 +56,7 @@ func MakeHPA(pa *v1alpha1.PodAutoscaler, config *autoscaler.Config) *autoscaling
 		hpa.Spec.MinReplicas = &min
 	}
 
-	switch pa.Metric() {
-	case autoscaling.CPU:
+	if pa.Metric() == autoscaling.CPU {
 		if target, ok := pa.Target(); ok {
 			hpa.Spec.Metrics = []autoscalingv2beta1.MetricSpec{{
 				Type: autoscalingv2beta1.ResourceMetricSourceType,
@@ -70,22 +66,6 @@ func MakeHPA(pa *v1alpha1.PodAutoscaler, config *autoscaler.Config) *autoscaling
 				},
 			}}
 		}
-	case autoscaling.Concurrency, autoscaling.RPS:
-		t, _ := aresources.ResolveMetricTarget(pa, config)
-		target := int64(math.Ceil(t))
-		hpa.Spec.Metrics = []autoscalingv2beta1.MetricSpec{{
-			Type: autoscalingv2beta1.ObjectMetricSourceType,
-			Object: &autoscalingv2beta1.ObjectMetricSource{
-				Target: autoscalingv2beta1.CrossVersionObjectReference{
-					APIVersion: servingv1alpha1.SchemeGroupVersion.String(),
-					Kind:       "revision",
-					Name:       pa.Name,
-				},
-				MetricName:   pa.Metric(),
-				AverageValue: resource.NewQuantity(target, resource.DecimalSI),
-				TargetValue:  *resource.NewQuantity(target, resource.DecimalSI),
-			},
-		}}
 	}
 	return hpa
 }

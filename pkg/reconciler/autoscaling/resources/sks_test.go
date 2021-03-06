@@ -22,16 +22,16 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/networking/pkg/apis/networking"
+	nv1a1 "knative.dev/networking/pkg/apis/networking/v1alpha1"
 	"knative.dev/pkg/ptr"
-	pav1a1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
-	"knative.dev/serving/pkg/apis/networking"
-	nv1a1 "knative.dev/serving/pkg/apis/networking/v1alpha1"
+	autoscalingv1alpha1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
 	"knative.dev/serving/pkg/apis/serving"
 )
 
 // MakeSKS makes an SKS resource from the PA, selector and operation mode.
 func TestMakeSKS(t *testing.T) {
-	pa := &pav1a1.PodAutoscaler{
+	pa := &autoscalingv1alpha1.PodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "here",
 			Name:      "with-you",
@@ -45,7 +45,7 @@ func TestMakeSKS(t *testing.T) {
 				"a": "b",
 			},
 		},
-		Spec: pav1a1.PodAutoscalerSpec{
+		Spec: autoscalingv1alpha1.PodAutoscalerSpec{
 			ProtocolType: networking.ProtocolHTTP1,
 			ScaleTargetRef: corev1.ObjectReference{
 				APIVersion: "apps/v1",
@@ -56,6 +56,7 @@ func TestMakeSKS(t *testing.T) {
 	}
 
 	const mode = nv1a1.SKSOperationModeServe
+	const na = 42
 
 	want := &nv1a1.ServerlessService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -70,7 +71,7 @@ func TestMakeSKS(t *testing.T) {
 				"a": "b",
 			},
 			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion:         pav1a1.SchemeGroupVersion.String(),
+				APIVersion:         autoscalingv1alpha1.SchemeGroupVersion.String(),
 				Kind:               "PodAutoscaler",
 				Name:               "with-you",
 				UID:                "2006",
@@ -79,8 +80,9 @@ func TestMakeSKS(t *testing.T) {
 			}},
 		},
 		Spec: nv1a1.ServerlessServiceSpec{
-			ProtocolType: networking.ProtocolHTTP1,
-			Mode:         nv1a1.SKSOperationModeServe,
+			ProtocolType:  networking.ProtocolHTTP1,
+			Mode:          nv1a1.SKSOperationModeServe,
+			NumActivators: na,
 			ObjectRef: corev1.ObjectReference{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
@@ -88,7 +90,7 @@ func TestMakeSKS(t *testing.T) {
 			},
 		},
 	}
-	if got, want := MakeSKS(pa, mode), want; !cmp.Equal(got, want) {
+	if got, want := MakeSKS(pa, mode, na), want; !cmp.Equal(got, want) {
 		t.Errorf("MakeSKS = %#v, want: %#v, diff: %s", got, want, cmp.Diff(got, want))
 	}
 }

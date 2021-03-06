@@ -13,22 +13,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package domains
 
 import (
 	"context"
 	"testing"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/google/go-cmp/cmp"
 	"knative.dev/pkg/apis"
+	pkgnet "knative.dev/pkg/network"
 
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/gc"
-	"knative.dev/serving/pkg/network"
+	network "knative.dev/networking/pkg"
+	"knative.dev/serving/pkg/apis/serving"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/serving/pkg/reconciler/route/config"
 )
 
@@ -45,9 +45,6 @@ func testConfig() *config.Config {
 		Network: &network.Config{
 			DefaultIngressClass: "ingress-class-foo",
 			DomainTemplate:      network.DefaultDomainTemplate,
-		},
-		GC: &gc.Config{
-			StaleRevisionLastpinnedDebounce: time.Duration(1 * time.Minute),
 		},
 	}
 }
@@ -79,7 +76,7 @@ func TestDomainNameFromTemplate(t *testing.T) {
 		name:     "LocalDash",
 		template: "{{.Name}}-{{.Namespace}}.{{.Domain}}",
 		args:     args{name: "test-name"},
-		want:     "test-name.default.svc.cluster.local",
+		want:     pkgnet.GetServiceHostname("test-name", "default"),
 		local:    true,
 	}, {
 		name:     "Short",
@@ -88,10 +85,10 @@ func TestDomainNameFromTemplate(t *testing.T) {
 		want:     "test-name.example.com",
 		local:    false,
 	}, {
-		name:     "SuperShort",
+		name:     "Too Short", // domain must be at least two segments separated by dots.
 		template: "{{.Name}}",
 		args:     args{name: "test-name"},
-		want:     "test-name",
+		wantErr:  true,
 		local:    false,
 	}, {
 		name:     "Annotations",
@@ -100,20 +97,33 @@ func TestDomainNameFromTemplate(t *testing.T) {
 		want:     "test-name.mysub.example.com",
 		local:    false,
 	}, {
+		name:     "Labels",
+		template: `{{.Name}}.{{ index .Labels "bus"}}.{{.Domain}}`,
+		args:     args{name: "test-name"},
+		want:     "test-name.mybus.example.com",
+		local:    false,
+	}, {
 		// This cannot get through our validation, but verify we handle errors.
 		name:     "BadVarName",
 		template: "{{.Name}}.{{.NNNamespace}}.{{.Domain}}",
 		args:     args{name: "test-name"},
 		wantErr:  true,
 		local:    false,
+	}, {
+		name:     "Invalid domain name",
+		template: "{{.Name}}.{{.Namespace}}.{{.Domain}}.Foo",
+		args:     args{name: "test-name"},
+		wantErr:  true,
+		local:    false,
 	}}
 
 	meta := metav1.ObjectMeta{
-		SelfLink:  "/apis/serving/v1alpha1/namespaces/test/Routes/myapp",
+		SelfLink:  "/apis/serving/v1/namespaces/test/Routes/myapp",
 		Name:      "myroute",
 		Namespace: "default",
 		Labels: map[string]string{
 			"route": "myapp",
+			"bus":   "mybus",
 		},
 		Annotations: map[string]string{
 			"sub": "mysub",
@@ -128,9 +138,9 @@ func TestDomainNameFromTemplate(t *testing.T) {
 			ctx = config.ToContext(ctx, cfg)
 
 			if tt.local {
-				meta.Labels[config.VisibilityLabelKey] = config.VisibilityClusterLocal
+				meta.Labels[network.VisibilityLabelKey] = serving.VisibilityClusterLocal
 			} else {
-				delete(meta.Labels, config.VisibilityLabelKey)
+				delete(meta.Labels, network.VisibilityLabelKey)
 			}
 
 			got, err := DomainNameFromTemplate(ctx, meta, tt.args.name)
@@ -213,20 +223,25 @@ func TestGetAllDomainsAndTags(t *testing.T) {
 			"myroute.default.example.com":              "",
 		},
 	}, {
-		name:           "bad template",
+		name:           "bad template in domain template",
 		domainTemplate: "{{.NNName}}.{{.Namespace}}.{{.Domain}}",
 		tagTemplate:    "{{.Name}}-{{.Tag}}",
 		wantErr:        true,
 	}, {
-		name:           "bad template",
+		name:           "bad template in tag template",
 		domainTemplate: "{{.Name}}.{{.Namespace}}.{{.Domain}}",
 		tagTemplate:    "{{.NNName}}-{{.Tag}}",
 		wantErr:        true,
+	}, {
+		name:           "bad domain name",
+		domainTemplate: "{{.Name}}.{{.Namespace}}.{{.Domain}}",
+		tagTemplate:    "Foo.{{.Name}}-{{.Tag}}",
+		wantErr:        true,
 	}}
 
-	route := &v1alpha1.Route{
+	route := &v1.Route{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/apis/serving/v1alpha1/namespaces/test/Routes/myapp",
+			SelfLink:  "/apis/serving/v1/namespaces/test/Routes/myapp",
 			Name:      "myroute",
 			Namespace: "default",
 			Labels: map[string]string{
@@ -244,13 +259,13 @@ func TestGetAllDomainsAndTags(t *testing.T) {
 			ctx = config.ToContext(ctx, cfg)
 
 			// here, a tag-less major domain will have empty string as the input
-			got, err := GetAllDomainsAndTags(ctx, route, []string{"", "target-1", "target-2"}, sets.String{})
+			got, err := GetAllDomainsAndTags(ctx, route, []string{"", "target-1", "target-2"}, nil /* visibility */)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetAllDomains() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
-				t.Errorf("GetAllDomains() diff (-want +got): %v", diff)
+				t.Error("GetAllDomains() diff (-want +got):", diff)
 			}
 		})
 	}

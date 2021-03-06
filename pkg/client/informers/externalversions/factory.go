@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ import (
 	versioned "knative.dev/serving/pkg/client/clientset/versioned"
 	autoscaling "knative.dev/serving/pkg/client/informers/externalversions/autoscaling"
 	internalinterfaces "knative.dev/serving/pkg/client/informers/externalversions/internalinterfaces"
-	networking "knative.dev/serving/pkg/client/informers/externalversions/networking"
 	serving "knative.dev/serving/pkg/client/informers/externalversions/serving"
 )
 
@@ -175,16 +174,11 @@ type SharedInformerFactory interface {
 	WaitForCacheSync(stopCh <-chan struct{}) map[reflect.Type]bool
 
 	Autoscaling() autoscaling.Interface
-	Networking() networking.Interface
 	Serving() serving.Interface
 }
 
 func (f *sharedInformerFactory) Autoscaling() autoscaling.Interface {
 	return autoscaling.New(f, f.namespace, f.tweakListOptions)
-}
-
-func (f *sharedInformerFactory) Networking() networking.Interface {
-	return networking.New(f, f.namespace, f.tweakListOptions)
 }
 
 func (f *sharedInformerFactory) Serving() serving.Interface {

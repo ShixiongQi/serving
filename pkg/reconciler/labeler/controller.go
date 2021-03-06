@@ -19,17 +19,21 @@ package labeler
 import (
 	"context"
 
-	configurationinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/configuration"
-	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision"
-	routeinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/route"
+	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/client-go/tools/cache"
+
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	servingclient "knative.dev/serving/pkg/client/injection/client"
+	configurationinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/configuration"
+	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
+	routeinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/route"
+	routereconciler "knative.dev/serving/pkg/client/injection/reconciler/serving/v1/route"
+	"knative.dev/serving/pkg/reconciler/configuration/config"
 
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
-	"knative.dev/serving/pkg/reconciler"
-)
-
-const (
-	controllerAgentName = "labeler-controller"
+	"knative.dev/pkg/logging"
+	"knative.dev/pkg/tracker"
 )
 
 // NewController wraps a new instance of the labeler that labels
@@ -38,21 +42,52 @@ func NewController(
 	ctx context.Context,
 	cmw configmap.Watcher,
 ) *controller.Impl {
-
+	logger := logging.FromContext(ctx)
 	routeInformer := routeinformer.Get(ctx)
 	configInformer := configurationinformer.Get(ctx)
 	revisionInformer := revisioninformer.Get(ctx)
 
-	c := &Reconciler{
-		Base:                reconciler.NewBase(ctx, controllerAgentName, cmw),
-		routeLister:         routeInformer.Lister(),
-		configurationLister: configInformer.Lister(),
-		revisionLister:      revisionInformer.Lister(),
-	}
-	impl := controller.NewImpl(c, c.Logger, "Labels")
+	logger.Info("Setting up ConfigMap receivers")
+	configStore := config.NewStore(logger.Named("config-store"))
+	configStore.WatchConfigs(cmw)
 
-	c.Logger.Info("Setting up event handlers")
+	c := &Reconciler{}
+	impl := routereconciler.NewImpl(ctx, c, func(*controller.Impl) controller.Options {
+		return controller.Options{
+			ConfigStore: configStore,
+			// The labeler shouldn't mutate the route's status.
+			SkipStatusUpdates: true,
+		}
+	})
+
+	logger.Info("Setting up event handlers")
 	routeInformer.Informer().AddEventHandler(controller.HandleAll(impl.Enqueue))
+
+	tracker := tracker.New(impl.EnqueueKey, controller.GetTrackerLease(ctx))
+
+	// Make sure trackers are deleted once the observers are removed.
+	routeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: tracker.OnDeletedObserver,
+	})
+
+	configInformer.Informer().AddEventHandler(controller.HandleAll(
+		controller.EnsureTypeMeta(
+			tracker.OnChanged,
+			v1.SchemeGroupVersion.WithKind("Configuration"),
+		),
+	))
+
+	revisionInformer.Informer().AddEventHandler(controller.HandleAll(
+		controller.EnsureTypeMeta(
+			tracker.OnChanged,
+			v1.SchemeGroupVersion.WithKind("Revision"),
+		),
+	))
+
+	client := servingclient.Get(ctx)
+	clock := &clock.RealClock{}
+	c.caccV2 = newConfigurationAccessor(client, tracker, configInformer.Lister(), configInformer.Informer().GetIndexer(), clock)
+	c.raccV2 = newRevisionAccessor(client, tracker, revisionInformer.Lister(), revisionInformer.Informer().GetIndexer(), clock)
 
 	return impl
 }

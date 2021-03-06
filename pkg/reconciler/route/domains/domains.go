@@ -23,23 +23,24 @@ import (
 	"strings"
 	"text/template"
 
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	network "knative.dev/networking/pkg"
+	netv1alpha1 "knative.dev/networking/pkg/apis/networking/v1alpha1"
+	"knative.dev/pkg/apis"
 	pkgnet "knative.dev/pkg/network"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/network"
+	"knative.dev/serving/pkg/apis/serving"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/serving/pkg/reconciler/route/config"
 	"knative.dev/serving/pkg/reconciler/route/resources/labels"
-
-	"knative.dev/pkg/apis"
 )
 
 // HTTPScheme is the string representation of http.
 const HTTPScheme string = "http"
 
 // GetAllDomainsAndTags returns all of the domains and tags(including subdomains) associated with a Route
-func GetAllDomainsAndTags(ctx context.Context, r *v1alpha1.Route, names []string, localServiceNames sets.String) (map[string]string, error) {
+func GetAllDomainsAndTags(ctx context.Context, r *v1.Route, names []string, visibility map[string]netv1alpha1.IngressVisibility) (map[string]string, error) {
 	domainTagMap := make(map[string]string)
 
 	for _, name := range names {
@@ -50,7 +51,7 @@ func GetAllDomainsAndTags(ctx context.Context, r *v1alpha1.Route, names []string
 			return nil, err
 		}
 
-		labels.SetVisibility(meta, localServiceNames.Has(hostname))
+		labels.SetVisibility(meta, visibility[name] == netv1alpha1.IngressVisibilityClusterLocal)
 
 		subDomain, err := DomainNameFromTemplate(ctx, *meta, hostname)
 		if err != nil {
@@ -63,7 +64,7 @@ func GetAllDomainsAndTags(ctx context.Context, r *v1alpha1.Route, names []string
 
 // DomainNameFromTemplate generates domain name base on the template specified in the `config-network` ConfigMap.
 // name is the "subdomain" which will be referred as the "name" in the template
-func DomainNameFromTemplate(ctx context.Context, r v1.ObjectMeta, name string) (string, error) {
+func DomainNameFromTemplate(ctx context.Context, r metav1.ObjectMeta, name string) (string, error) {
 	domainConfig := config.FromContext(ctx).Domain
 	rLabels := r.Labels
 	domain := domainConfig.LookupDomainForLabels(rLabels)
@@ -76,6 +77,7 @@ func DomainNameFromTemplate(ctx context.Context, r v1.ObjectMeta, name string) (
 		Namespace:   r.Namespace,
 		Domain:      domain,
 		Annotations: annotations,
+		Labels:      rLabels,
 	}
 
 	networkConfig := config.FromContext(ctx).Network
@@ -84,7 +86,7 @@ func DomainNameFromTemplate(ctx context.Context, r v1.ObjectMeta, name string) (
 	var templ *template.Template
 	// If the route is "cluster local" then don't use the user-defined
 	// domain template, use the default one
-	if rLabels[config.VisibilityLabelKey] == config.VisibilityClusterLocal {
+	if rLabels[network.VisibilityLabelKey] == serving.VisibilityClusterLocal {
 		templ = template.Must(template.New("domain-template").Parse(
 			network.DefaultDomainTemplate))
 	} else {
@@ -94,12 +96,18 @@ func DomainNameFromTemplate(ctx context.Context, r v1.ObjectMeta, name string) (
 	if err := templ.Execute(&buf, data); err != nil {
 		return "", fmt.Errorf("error executing the DomainTemplate: %w", err)
 	}
+
+	urlErrs := validation.IsFullyQualifiedDomainName(field.NewPath("url"), buf.String())
+	if urlErrs != nil {
+		return "", fmt.Errorf("invalid domain name %q: %w", buf.String(), urlErrs.ToAggregate())
+	}
+
 	return buf.String(), nil
 }
 
 // HostnameFromTemplate generates domain name base on the template specified in the `config-network` ConfigMap.
 // name is the "subdomain" which will be referred as the "name" in the template
-func HostnameFromTemplate(ctx context.Context, name string, tag string) (string, error) {
+func HostnameFromTemplate(ctx context.Context, name, tag string) (string, error) {
 	if tag == "" {
 		return name, nil
 	}

@@ -17,12 +17,14 @@ limitations under the License.
 package serving
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"knative.dev/pkg/kmp"
 	"knative.dev/pkg/ptr"
+	"knative.dev/serving/pkg/apis/config"
 )
 
 func TestVolumeMask(t *testing.T) {
@@ -35,13 +37,13 @@ func TestVolumeMask(t *testing.T) {
 	got := VolumeMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("VolumeMask (-want, +got): %s", diff)
+		t.Error("VolumeMask (-want, +got):", diff)
 	}
 
 	if got = VolumeMask(nil); got != nil {
@@ -63,13 +65,13 @@ func TestVolumeSourceMask(t *testing.T) {
 	got := VolumeSourceMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("VolumeSourceMask (-want, +got): %s", diff)
+		t.Error("VolumeSourceMask (-want, +got):", diff)
 	}
 
 	if got = VolumeSourceMask(nil); got != nil {
@@ -117,19 +119,20 @@ func TestPodSpecMask(t *testing.T) {
 		}},
 	}
 
-	got := PodSpecMask(in)
+	ctx := context.Background()
+	got := PodSpecMask(ctx, in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("PodSpecMask (-want, +got): %s", diff)
+		t.Error("PodSpecMask (-want, +got):", diff)
 	}
 
-	if got = PodSpecMask(nil); got != nil {
+	if got = PodSpecMask(ctx, nil); got != nil {
 		t.Errorf("PodSpecMask(nil) = %v, want: nil", got)
 	}
 }
@@ -176,13 +179,13 @@ func TestContainerMask(t *testing.T) {
 	got := ContainerMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ContainerMask (-want, +got): %s", diff)
+		t.Error("ContainerMask (-want, +got):", diff)
 	}
 
 	if got = ContainerMask(nil); got != nil {
@@ -210,13 +213,13 @@ func TestVolumeMountMask(t *testing.T) {
 	got := VolumeMountMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("VolumeMountMask (-want, +got): %s", diff)
+		t.Error("VolumeMountMask (-want, +got):", diff)
 	}
 
 	if got = VolumeMountMask(nil); got != nil {
@@ -238,13 +241,13 @@ func TestProbeMask(t *testing.T) {
 	got := ProbeMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ProbeMask (-want, +got): %s", diff)
+		t.Error("ProbeMask (-want, +got):", diff)
 	}
 
 	if got = ProbeMask(nil); got != nil {
@@ -263,13 +266,13 @@ func TestHandlerMask(t *testing.T) {
 	got := HandlerMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("HandlerMask (-want, +got): %s", diff)
+		t.Error("HandlerMask (-want, +got):", diff)
 	}
 
 	if got = HandlerMask(nil); got != nil {
@@ -286,13 +289,13 @@ func TestExecActionMask(t *testing.T) {
 	got := ExecActionMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ExecActionMask (-want, +got): %s", diff)
+		t.Error("ExecActionMask (-want, +got):", diff)
 	}
 
 	if got = ExecActionMask(nil); got != nil {
@@ -318,13 +321,13 @@ func TestHTTPGetActionMask(t *testing.T) {
 	got := HTTPGetActionMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("HTTPGetActionMask (-want, +got): %s", diff)
+		t.Error("HTTPGetActionMask (-want, +got):", diff)
 	}
 
 	if got = HTTPGetActionMask(nil); got != nil {
@@ -344,13 +347,13 @@ func TestTCPSocketActionMask(t *testing.T) {
 	got := TCPSocketActionMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("TCPSocketActionMask (-want, +got): %s", diff)
+		t.Error("TCPSocketActionMask (-want, +got):", diff)
 	}
 
 	if got = TCPSocketActionMask(nil); got != nil {
@@ -375,13 +378,13 @@ func TestContainerPortMask(t *testing.T) {
 	got := ContainerPortMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ContainerPortMask (-want, +got): %s", diff)
+		t.Error("ContainerPortMask (-want, +got):", diff)
 	}
 
 	if got = ContainerPortMask(nil); got != nil {
@@ -400,13 +403,13 @@ func TestEnvVarMask(t *testing.T) {
 	got := EnvVarMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("EnvVarMask (-want, +got): %s", diff)
+		t.Error("EnvVarMask (-want, +got):", diff)
 	}
 
 	if got = EnvVarMask(nil); got != nil {
@@ -415,31 +418,59 @@ func TestEnvVarMask(t *testing.T) {
 }
 
 func TestEnvVarSourceMask(t *testing.T) {
-	want := &corev1.EnvVarSource{
-		ConfigMapKeyRef: &corev1.ConfigMapKeySelector{},
-		SecretKeyRef:    &corev1.SecretKeySelector{},
-	}
-	in := &corev1.EnvVarSource{
-		ConfigMapKeyRef:  &corev1.ConfigMapKeySelector{},
-		SecretKeyRef:     &corev1.SecretKeySelector{},
-		FieldRef:         &corev1.ObjectFieldSelector{},
-		ResourceFieldRef: &corev1.ResourceFieldSelector{},
-	}
+	tests := []struct {
+		name     string
+		fieldRef bool
+		in       *corev1.EnvVarSource
+		want     *corev1.EnvVarSource
+	}{{
+		name:     "FieldRef false",
+		fieldRef: false,
+		in: &corev1.EnvVarSource{
+			ConfigMapKeyRef:  &corev1.ConfigMapKeySelector{},
+			SecretKeyRef:     &corev1.SecretKeySelector{},
+			FieldRef:         &corev1.ObjectFieldSelector{},
+			ResourceFieldRef: &corev1.ResourceFieldSelector{},
+		},
+		want: &corev1.EnvVarSource{
+			ConfigMapKeyRef: &corev1.ConfigMapKeySelector{},
+			SecretKeyRef:    &corev1.SecretKeySelector{},
+		},
+	}, {
+		name:     "FieldRef true",
+		fieldRef: true,
+		in: &corev1.EnvVarSource{
+			ConfigMapKeyRef:  &corev1.ConfigMapKeySelector{},
+			SecretKeyRef:     &corev1.SecretKeySelector{},
+			FieldRef:         &corev1.ObjectFieldSelector{},
+			ResourceFieldRef: &corev1.ResourceFieldSelector{},
+		},
+		want: &corev1.EnvVarSource{
+			ConfigMapKeyRef:  &corev1.ConfigMapKeySelector{},
+			SecretKeyRef:     &corev1.SecretKeySelector{},
+			FieldRef:         &corev1.ObjectFieldSelector{},
+			ResourceFieldRef: &corev1.ResourceFieldSelector{},
+		},
+	}}
 
-	got := EnvVarSourceMask(in)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := EnvVarSourceMask(test.in, test.fieldRef)
 
-	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
-	}
+			if &test.want == &got {
+				t.Error("Input and output share addresses. Want different addresses")
+			}
 
-	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
-	} else if diff != "" {
-		t.Errorf("EnvVarSourceMask (-want, +got): %s", diff)
-	}
+			if diff, err := kmp.SafeDiff(test.want, got); err != nil {
+				t.Error("Got error comparing output, err =", err)
+			} else if diff != "" {
+				t.Error("EnvVarSourceMask (-want, +got):", diff)
+			}
 
-	if got = EnvVarSourceMask(nil); got != nil {
-		t.Errorf("EnvVarSourceMask(nil) = %v, want: nil", got)
+			if got = EnvVarSourceMask(nil, test.fieldRef); got != nil {
+				t.Errorf("EnvVarSourceMask(nil) = %v, want: nil", got)
+			}
+		})
 	}
 }
 
@@ -452,13 +483,13 @@ func TestLocalObjectReferenceMask(t *testing.T) {
 	got := LocalObjectReferenceMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("LocalObjectReferenceMask (-want, +got): %s", diff)
+		t.Error("LocalObjectReferenceMask (-want, +got):", diff)
 	}
 
 	if got = LocalObjectReferenceMask(nil); got != nil {
@@ -477,13 +508,13 @@ func TestConfigMapKeySelectorMask(t *testing.T) {
 	got := ConfigMapKeySelectorMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ConfigMapKeySelectorMask (-want, +got): %s", diff)
+		t.Error("ConfigMapKeySelectorMask (-want, +got):", diff)
 	}
 
 	if got = ConfigMapKeySelectorMask(nil); got != nil {
@@ -502,13 +533,13 @@ func TestSecretKeySelectorMask(t *testing.T) {
 	got := SecretKeySelectorMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("SecretKeySelectorMask (-want, +got): %s", diff)
+		t.Error("SecretKeySelectorMask (-want, +got):", diff)
 	}
 
 	if got = SecretKeySelectorMask(nil); got != nil {
@@ -526,13 +557,13 @@ func TestConfigMapEnvSourceMask(t *testing.T) {
 	got := ConfigMapEnvSourceMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ConfigMapEnvSourceMask (-want, +got): %s", diff)
+		t.Error("ConfigMapEnvSourceMask (-want, +got):", diff)
 	}
 
 	if got = ConfigMapEnvSourceMask(nil); got != nil {
@@ -550,13 +581,13 @@ func TestSecretEnvSourceMask(t *testing.T) {
 	got := SecretEnvSourceMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("SecretEnvSourceMask (-want, +got): %s", diff)
+		t.Error("SecretEnvSourceMask (-want, +got):", diff)
 	}
 
 	if got = SecretEnvSourceMask(nil); got != nil {
@@ -575,13 +606,13 @@ func TestEnvFromSourceMask(t *testing.T) {
 	got := EnvFromSourceMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("EnvFromSourceMask (-want, +got): %s", diff)
+		t.Error("EnvFromSourceMask (-want, +got):", diff)
 	}
 
 	if got = EnvFromSourceMask(nil); got != nil {
@@ -599,13 +630,13 @@ func TestResourceRequirementsMask(t *testing.T) {
 	got := ResourceRequirementsMask(in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("ResourceRequirementsMask (-want, +got): %s", diff)
+		t.Error("ResourceRequirementsMask (-want, +got):", diff)
 	}
 
 	if got = ResourceRequirementsMask(nil); got != nil {
@@ -613,10 +644,84 @@ func TestResourceRequirementsMask(t *testing.T) {
 	}
 }
 
+func TestPodSecurityContextMask(t *testing.T) {
+	in := &corev1.PodSecurityContext{
+		SELinuxOptions:     &corev1.SELinuxOptions{},
+		WindowsOptions:     &corev1.WindowsSecurityContextOptions{},
+		SupplementalGroups: []int64{},
+		Sysctls:            []corev1.Sysctl{},
+		RunAsUser:          ptr.Int64(1),
+		RunAsGroup:         ptr.Int64(1),
+		RunAsNonRoot:       ptr.Bool(true),
+		FSGroup:            ptr.Int64(1),
+	}
+
+	want := &corev1.PodSecurityContext{}
+	ctx := context.Background()
+
+	got := PodSecurityContextMask(ctx, in)
+
+	if &want == &got {
+		t.Error("Input and output share addresses. Want different addresses")
+	}
+
+	if diff, err := kmp.SafeDiff(want, got); err != nil {
+		t.Error("Got error comparing output, err =", err)
+	} else if diff != "" {
+		t.Error("PostSecurityContextMask (-want, +got):", diff)
+	}
+
+	if got = PodSecurityContextMask(ctx, nil); got != nil {
+		t.Errorf("PodSecurityContextMask(nil) = %v, want: nil", got)
+	}
+}
+
+func TestPodSecurityContextMask_FeatureEnabled(t *testing.T) {
+	in := &corev1.PodSecurityContext{
+		SELinuxOptions:     &corev1.SELinuxOptions{},
+		WindowsOptions:     &corev1.WindowsSecurityContextOptions{},
+		SupplementalGroups: []int64{1},
+		Sysctls:            []corev1.Sysctl{},
+		RunAsUser:          ptr.Int64(1),
+		RunAsGroup:         ptr.Int64(1),
+		RunAsNonRoot:       ptr.Bool(true),
+		FSGroup:            ptr.Int64(1),
+	}
+
+	want := &corev1.PodSecurityContext{
+		RunAsUser:          ptr.Int64(1),
+		RunAsGroup:         ptr.Int64(1),
+		RunAsNonRoot:       ptr.Bool(true),
+		FSGroup:            ptr.Int64(1),
+		SupplementalGroups: []int64{1},
+	}
+
+	ctx := config.ToContext(context.Background(),
+		&config.Config{
+			Features: &config.Features{
+				PodSpecSecurityContext: config.Enabled,
+			},
+		},
+	)
+
+	got := PodSecurityContextMask(ctx, in)
+
+	if &want == &got {
+		t.Error("Input and output share addresses. Want different addresses")
+	}
+
+	if diff, err := kmp.SafeDiff(want, got); err != nil {
+		t.Error("Got error comparing output, err =", err)
+	} else if diff != "" {
+		t.Error("PostSecurityContextMask (-want, +got):", diff)
+	}
+}
+
 func TestSecurityContextMask(t *testing.T) {
 	mtype := corev1.UnmaskedProcMount
 	want := &corev1.SecurityContext{
-		RunAsUser: ptr.Int64(1),
+		RunAsUser:              ptr.Int64(1),
+		ReadOnlyRootFilesystem: ptr.Bool(true),
 	}
 	in := &corev1.SecurityContext{
 		RunAsUser:                ptr.Int64(1),
@@ -630,19 +735,60 @@ func TestSecurityContextMask(t *testing.T) {
 		ProcMount:                &mtype,
 	}
 
-	got := SecurityContextMask(in)
+	got := SecurityContextMask(context.Background(), in)
 
 	if &want == &got {
-		t.Errorf("Input and output share addresses. Want different addresses")
+		t.Error("Input and output share addresses. Want different addresses")
 	}
 
 	if diff, err := kmp.SafeDiff(want, got); err != nil {
-		t.Errorf("Got error comparing output, err = %v", err)
+		t.Error("Got error comparing output, err =", err)
 	} else if diff != "" {
-		t.Errorf("SecurityContextMask (-want, +got): %s", diff)
+		t.Error("SecurityContextMask (-want, +got):", diff)
 	}
 
-	if got = SecurityContextMask(nil); got != nil {
+	if got = SecurityContextMask(context.Background(), nil); got != nil {
 		t.Errorf("SecurityContextMask(nil) = %v, want: nil", got)
+	}
+}
+
+func TestSecurityContextMask_FeatureEnabled(t *testing.T) {
+	mtype := corev1.UnmaskedProcMount
+	want := &corev1.SecurityContext{
+		RunAsGroup:             ptr.Int64(2),
+		RunAsNonRoot:           ptr.Bool(true),
+		RunAsUser:              ptr.Int64(1),
+		ReadOnlyRootFilesystem: ptr.Bool(true),
+	}
+	in := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.Bool(true),
+		Capabilities:             &corev1.Capabilities{},
+		Privileged:               ptr.Bool(true),
+		ProcMount:                &mtype,
+		ReadOnlyRootFilesystem:   ptr.Bool(true),
+		RunAsGroup:               ptr.Int64(2),
+		RunAsNonRoot:             ptr.Bool(true),
+		RunAsUser:                ptr.Int64(1),
+		SELinuxOptions:           &corev1.SELinuxOptions{},
+	}
+
+	ctx := config.ToContext(context.Background(),
+		&config.Config{
+			Features: &config.Features{
+				PodSpecSecurityContext: config.Enabled,
+			},
+		},
+	)
+
+	got := SecurityContextMask(ctx, in)
+
+	if &want == &got {
+		t.Error("Input and output share addresses. Want different addresses")
+	}
+
+	if diff, err := kmp.SafeDiff(want, got); err != nil {
+		t.Error("Got error comparing output, err =", err)
+	} else if diff != "" {
+		t.Error("SecurityContextMask (-want, +got):", diff)
 	}
 }

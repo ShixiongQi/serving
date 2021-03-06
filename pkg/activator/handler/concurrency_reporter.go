@@ -18,119 +18,237 @@ package handler
 
 import (
 	"context"
+	"math"
+	"net/http"
+	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
-
 	"k8s.io/apimachinery/pkg/types"
-
+	network "knative.dev/networking/pkg"
 	"knative.dev/pkg/logging"
+	pkgmetrics "knative.dev/pkg/metrics"
 	"knative.dev/serving/pkg/activator"
 	"knative.dev/serving/pkg/apis/serving"
-	"knative.dev/serving/pkg/autoscaler"
-	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision"
-	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
+	asmetrics "knative.dev/serving/pkg/autoscaler/metrics"
+	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision"
+	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1"
+	"knative.dev/serving/pkg/metrics"
 )
+
+const reportInterval = time.Second
+
+// revisionStats is a type that wraps information needed to calculate stats per revision.
+//
+// stats is thread-safe in itself and thus needs no extra synchronization.
+// firstRequest is only read/mutated in `report` which is guaranteed to be single-threaded
+// as it is driven by the report channel.
+type revisionStats struct {
+	stats        *network.RequestStats
+	firstRequest float64
+	refs         atomic.Int64
+}
 
 // ConcurrencyReporter reports stats based on incoming requests and ticks.
 type ConcurrencyReporter struct {
 	logger  *zap.SugaredLogger
 	podName string
 
-	// Ticks with every request arrived/completed respectively
-	reqCh chan ReqEvent
-	// Ticks with every stat report request
-	reportCh <-chan time.Time
 	// Stat reporting channel
-	statCh chan []autoscaler.StatMessage
+	statCh chan []asmetrics.StatMessage
 
 	rl servinglisters.RevisionLister
-	sr activator.StatsReporter
+
+	mux sync.RWMutex
+	// This map holds the concurrency and request count accounting across revisions.
+	stats map[types.NamespacedName]*revisionStats
 }
 
 // NewConcurrencyReporter creates a ConcurrencyReporter which listens to incoming
 // ReqEvents on reqCh and ticks on reportCh and reports stats on statCh.
-func NewConcurrencyReporter(ctx context.Context, podName string,
-	reqCh chan ReqEvent, reportCh <-chan time.Time, statCh chan []autoscaler.StatMessage,
-	sr activator.StatsReporter) *ConcurrencyReporter {
+func NewConcurrencyReporter(ctx context.Context, podName string, statCh chan []asmetrics.StatMessage) *ConcurrencyReporter {
 	return &ConcurrencyReporter{
-		logger:   logging.FromContext(ctx),
-		podName:  podName,
-		reqCh:    reqCh,
-		reportCh: reportCh,
-		statCh:   statCh,
-		rl:       revisioninformer.Get(ctx).Lister(),
-		sr:       sr,
+		logger:  logging.FromContext(ctx),
+		podName: podName,
+		statCh:  statCh,
+		rl:      revisioninformer.Get(ctx).Lister(),
+
+		stats: make(map[types.NamespacedName]*revisionStats),
 	}
 }
 
-func (cr *ConcurrencyReporter) reportToMetricsBackend(key types.NamespacedName, concurrency int32) {
+// handleRequestIn handles an event of a request coming into the system. Returns the stats
+// the outgoing event should be recorded to.
+func (cr *ConcurrencyReporter) handleRequestIn(event network.ReqEvent) *revisionStats {
+	stat, msg := cr.getOrCreateStat(event)
+	if msg != nil {
+		cr.statCh <- []asmetrics.StatMessage{*msg}
+	}
+	stat.stats.HandleEvent(event)
+	return stat
+}
+
+// handleRequestOut handles an event of a request being done. Takes the stats returned by
+// the handleRequestIn call.
+func (cr *ConcurrencyReporter) handleRequestOut(stat *revisionStats, event network.ReqEvent) {
+	stat.stats.HandleEvent(event)
+	stat.refs.Dec()
+}
+
+// getOrCreateStat gets a stat from the state if present.
+// If absent it creates a new one and returns it, potentially returning a StatMessage too
+// to trigger an immediate scale-from-0.
+func (cr *ConcurrencyReporter) getOrCreateStat(event network.ReqEvent) (*revisionStats, *asmetrics.StatMessage) {
+	cr.mux.RLock()
+	stat := cr.stats[event.Key]
+	if stat != nil {
+		// Since this is incremented under the lock, it's guaranteed to be observed by
+		// the deletion routine.
+		stat.refs.Inc()
+		cr.mux.RUnlock()
+		return stat, nil
+	}
+	cr.mux.RUnlock()
+
+	// Doubly checked locking.
+	cr.mux.Lock()
+	defer cr.mux.Unlock()
+
+	stat = cr.stats[event.Key]
+	if stat != nil {
+		// Since this is incremented under the lock, it's guaranteed to be observed by
+		// the deletion routine.
+		stat.refs.Inc()
+		return stat, nil
+	}
+
+	stat = &revisionStats{
+		stats:        network.NewRequestStats(event.Time),
+		firstRequest: 1,
+	}
+	stat.refs.Inc()
+	cr.stats[event.Key] = stat
+
+	return stat, &asmetrics.StatMessage{
+		Key: event.Key,
+		Stat: asmetrics.Stat{
+			PodName:                   cr.podName,
+			AverageConcurrentRequests: 1,
+			// The way the checks are written, this cannot ever be
+			// anything else but 1. The stats map key is only deleted
+			// after a reporting period, so we see this code path at most
+			// once per period.
+			RequestCount: 1,
+		},
+	}
+}
+
+// report cuts a report from all collected statistics and sends the respective messages
+// via the statsCh and reports the concurrency metrics to prometheus.
+func (cr *ConcurrencyReporter) report(now time.Time) []asmetrics.StatMessage {
+	msgs, toDelete := cr.computeReport(now)
+
+	if len(toDelete) > 0 {
+		cr.mux.Lock()
+		defer cr.mux.Unlock()
+		for _, key := range toDelete {
+			// Avoid deleting the stat if a request raced fetching it while we've been
+			// busy reporting.
+			if cr.stats[key].refs.Load() == 0 {
+				delete(cr.stats, key)
+			}
+		}
+	}
+
+	return msgs
+}
+
+func (cr *ConcurrencyReporter) computeReport(now time.Time) (msgs []asmetrics.StatMessage, toDelete []types.NamespacedName) {
+	cr.mux.RLock()
+	defer cr.mux.RUnlock()
+	msgs = make([]asmetrics.StatMessage, 0, len(cr.stats))
+	for key, stat := range cr.stats {
+		report := stat.stats.Report(now)
+
+		firstAdj := stat.firstRequest
+		stat.firstRequest = 0.
+
+		// This is only 0 if we have seen no activity for the entire reporting
+		// period at all.
+		if report.AverageConcurrency == 0 {
+			toDelete = append(toDelete, key)
+		}
+
+		// Subtract the request we already reported when first seeing the
+		// revision. We report a min of 0 here because the initial report is
+		// always a concurrency of 1 and the actual concurrency reported over
+		// the reporting period might be < 1.
+		adjustedConcurrency := math.Max(report.AverageConcurrency-firstAdj, 0)
+		adjustedCount := report.RequestCount - firstAdj
+		msgs = append(msgs, asmetrics.StatMessage{
+			Key: key,
+			Stat: asmetrics.Stat{
+				PodName:                   cr.podName,
+				AverageConcurrentRequests: adjustedConcurrency,
+				RequestCount:              adjustedCount,
+			},
+		})
+	}
+
+	return msgs, toDelete
+}
+
+func (cr *ConcurrencyReporter) reportToMetricsBackend(key types.NamespacedName, concurrency float64) {
 	ns := key.Namespace
 	revName := key.Name
 	revision, err := cr.rl.Revisions(ns).Get(revName)
 	if err != nil {
-		cr.logger.Errorw("Error while getting revision", zap.Error(err))
+		cr.logger.Errorw("Error while getting revision", zap.Any("revID", key), zap.Error(err))
 		return
 	}
 	configurationName := revision.Labels[serving.ConfigurationLabelKey]
 	serviceName := revision.Labels[serving.ServiceLabelKey]
-	cr.sr.ReportRequestConcurrency(ns, serviceName, configurationName, revName, int64(concurrency))
+
+	reporterCtx, _ := metrics.PodRevisionContext(cr.podName, activator.Name, ns, serviceName, configurationName, revName)
+	pkgmetrics.Record(reporterCtx, requestConcurrencyM.M(concurrency))
 }
 
-// Run runs until stopCh is closed and processes events on all incoming channels
+// Run runs until stopCh is closed and processes events on all incoming channels.
 func (cr *ConcurrencyReporter) Run(stopCh <-chan struct{}) {
-	// Contains the number of in-flight requests per-key
-	outstandingRequestsPerKey := make(map[types.NamespacedName]int32)
-	// Contains the number of incoming requests in the current
-	// reporting period, per key.
-	incomingRequestsPerKey := make(map[types.NamespacedName]int32)
+	ticker := time.NewTicker(reportInterval)
+	defer ticker.Stop()
+	cr.run(stopCh, ticker.C)
+}
 
+func (cr *ConcurrencyReporter) run(stopCh <-chan struct{}, reportCh <-chan time.Time) {
 	for {
 		select {
-		case event := <-cr.reqCh:
-			switch event.EventType {
-			case ReqIn:
-				incomingRequestsPerKey[event.Key]++
-
-				// Report the first request for a key immediately.
-				if _, ok := outstandingRequestsPerKey[event.Key]; !ok {
-					cr.statCh <- []autoscaler.StatMessage{{
-						Key: event.Key,
-						Stat: autoscaler.Stat{
-							// Stat time is unset by design. The receiver will set the time.
-							PodName:                   cr.podName,
-							AverageConcurrentRequests: 1,
-							RequestCount:              float64(incomingRequestsPerKey[event.Key]),
-						},
-					}}
-				}
-				outstandingRequestsPerKey[event.Key]++
-			case ReqOut:
-				outstandingRequestsPerKey[event.Key]--
+		case now := <-reportCh:
+			msgs := cr.report(now)
+			for _, msg := range msgs {
+				cr.reportToMetricsBackend(msg.Key, msg.Stat.AverageConcurrentRequests)
 			}
-		case <-cr.reportCh:
-			messages := make([]autoscaler.StatMessage, 0, len(outstandingRequestsPerKey))
-			for key, concurrency := range outstandingRequestsPerKey {
-				if concurrency == 0 {
-					delete(outstandingRequestsPerKey, key)
-				} else {
-					messages = append(messages, autoscaler.StatMessage{
-						Key: key,
-						Stat: autoscaler.Stat{
-							// Stat time is unset by design. The receiver will set the time.
-							PodName:                   cr.podName,
-							AverageConcurrentRequests: float64(concurrency),
-							RequestCount:              float64(incomingRequestsPerKey[key]),
-						},
-					})
-				}
-				cr.reportToMetricsBackend(key, concurrency)
+			if len(msgs) > 0 {
+				cr.statCh <- msgs
 			}
-			cr.statCh <- messages
-
-			incomingRequestsPerKey = make(map[types.NamespacedName]int32)
 		case <-stopCh:
 			return
 		}
+	}
+}
+
+// Handler returns a handler that records requests coming in/being finished in the stats
+// machinery.
+func (cr *ConcurrencyReporter) Handler(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		revisionKey := RevIDFrom(r.Context())
+
+		stat := cr.handleRequestIn(network.ReqEvent{Key: revisionKey, Type: network.ReqIn, Time: time.Now()})
+		defer func() {
+			cr.handleRequestOut(stat, network.ReqEvent{Key: revisionKey, Type: network.ReqOut, Time: time.Now()})
+		}()
+
+		next.ServeHTTP(w, r)
 	}
 }

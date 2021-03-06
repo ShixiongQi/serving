@@ -24,39 +24,46 @@ import (
 	"time"
 
 	// Inject the informers this controller depends on.
+	fakenetworkingclient "knative.dev/networking/pkg/client/injection/client/fake"
+	_ "knative.dev/networking/pkg/client/injection/informers/networking/v1alpha1/certificate/fake"
+	fakeingressinformer "knative.dev/networking/pkg/client/injection/informers/networking/v1alpha1/ingress/fake"
 	_ "knative.dev/pkg/client/injection/kube/informers/core/v1/service/fake"
 	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
-	_ "knative.dev/serving/pkg/client/injection/informers/networking/v1alpha1/certificate/fake"
-	fakeingressinformer "knative.dev/serving/pkg/client/injection/informers/networking/v1alpha1/ingress/fake"
-	fakecfginformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/configuration/fake"
-	fakerevisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision/fake"
-	fakerouteinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/route/fake"
+	fakecfginformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/configuration/fake"
+	fakerevisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/revision/fake"
+	fakerouteinformer "knative.dev/serving/pkg/client/injection/informers/serving/v1/route/fake"
 
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/sync/errgroup"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
-	"knative.dev/pkg/apis"
-	duckv1 "knative.dev/pkg/apis/duck/v1"
+
+	network "knative.dev/networking/pkg"
+	"knative.dev/networking/pkg/apis/networking"
+	"knative.dev/networking/pkg/apis/networking/v1alpha1"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
+	pkgnet "knative.dev/pkg/network"
 	"knative.dev/pkg/ptr"
+	"knative.dev/pkg/reconciler"
 	"knative.dev/pkg/system"
-	netv1alpha1 "knative.dev/serving/pkg/apis/networking/v1alpha1"
+	cfgmap "knative.dev/serving/pkg/apis/config"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
 	"knative.dev/serving/pkg/gc"
-	"knative.dev/serving/pkg/network"
 	"knative.dev/serving/pkg/reconciler/route/config"
 	"knative.dev/serving/pkg/reconciler/route/domains"
 
+	_ "knative.dev/pkg/metrics/testing"
 	. "knative.dev/pkg/reconciler/testing"
-	. "knative.dev/serving/pkg/testing/v1alpha1"
+	. "knative.dev/serving/pkg/testing/v1"
 )
 
 const (
@@ -65,104 +72,34 @@ const (
 	prodDomainSuffix    = "prod-domain.com"
 )
 
-func getTestRouteWithTrafficTargets(trafficTarget RouteOption) *v1alpha1.Route {
-	return Route(testNamespace, "test-route", WithRouteLabel(map[string]string{"route": "test-route"}), trafficTarget)
-}
-
-func getTestRevision(name string) *v1alpha1.Revision {
-	return getTestRevisionWithCondition(name, apis.Condition{
-		Type:   v1alpha1.RevisionConditionReady,
-		Status: corev1.ConditionTrue,
-		Reason: "ServiceReady",
-	})
-}
-
-func getTestRevisionWithCondition(name string, cond apis.Condition) *v1alpha1.Revision {
-	return &v1alpha1.Revision{
+func testConfiguration() *v1.Configuration {
+	return &v1.Configuration{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  fmt.Sprintf("/apis/serving/v1alpha1/namespaces/test/revisions/%s", name),
-			Name:      name,
-			Namespace: testNamespace,
-		},
-		Spec: v1alpha1.RevisionSpec{
-			DeprecatedContainer: &corev1.Container{
-				Image: "test-image",
-			},
-		},
-		Status: v1alpha1.RevisionStatus{
-			ServiceName: name,
-			Status: duckv1.Status{
-				Conditions: duckv1.Conditions{cond},
-			},
-		},
-	}
-}
-
-func getTestConfiguration() *v1alpha1.Configuration {
-	return &v1alpha1.Configuration{
-		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/apis/serving/v1alpha1/namespaces/test/revisiontemplates/test-config",
 			Name:      "test-config",
 			Namespace: testNamespace,
 		},
-		Spec: v1alpha1.ConfigurationSpec{
-			// This is a workaround for generation initialization
-			DeprecatedGeneration: 1,
-			DeprecatedRevisionTemplate: &v1alpha1.RevisionTemplateSpec{
-				Spec: v1alpha1.RevisionSpec{
-					DeprecatedContainer: &corev1.Container{
-						Image: "test-image",
-					},
-				},
-			},
-		},
+		Spec: v1.ConfigurationSpec{},
 	}
 }
 
-func getTestRevisionForConfig(config *v1alpha1.Configuration) *v1alpha1.Revision {
-	rev := &v1alpha1.Revision{
-		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/apis/serving/v1alpha1/namespaces/test/revisions/p-deadbeef",
-			Name:      "p-deadbeef",
-			Namespace: testNamespace,
-			Labels: map[string]string{
-				serving.ConfigurationLabelKey: config.Name,
-			},
-		},
-		Spec: *config.Spec.GetTemplate().Spec.DeepCopy(),
-		Status: v1alpha1.RevisionStatus{
-			ServiceName: "p-deadbeef",
-		},
-	}
-	rev.Status.MarkResourcesAvailableTrue()
-	rev.Status.MarkContainerHealthyTrue()
-	return rev
+func testRevision() *v1.Revision {
+	return Revision(testNamespace, "p-deadbeef", func(r *v1.Revision) {
+		r.Spec = *(&v1.ConfigurationSpec{}).GetTemplate().Spec.DeepCopy()
+	}, MarkRevisionReady, WithK8sServiceName)
 }
 
-func newTestReconciler(t *testing.T, configs ...*corev1.ConfigMap) (
-	ctx context.Context,
-	informers []controller.Informer,
-	reconciler *Reconciler,
-	configMapWatcher *configmap.ManualWatcher,
-	cf context.CancelFunc) {
-	ctx, informers, _, reconciler, configMapWatcher, cf = newTestSetup(t)
-	return
-}
-
-func newTestSetup(t *testing.T, configs ...*corev1.ConfigMap) (
+func newTestSetup(t *testing.T, opts ...reconcilerOption) (
 	ctx context.Context,
 	informers []controller.Informer,
 	ctrl *controller.Impl,
-	reconciler *Reconciler,
 	configMapWatcher *configmap.ManualWatcher,
 	cf context.CancelFunc) {
 
 	ctx, cf, informers = SetupFakeContextWithCancel(t)
 	configMapWatcher = &configmap.ManualWatcher{Namespace: system.Namespace()}
-	ctrl = NewController(ctx, configMapWatcher)
-	reconciler = ctrl.Reconciler.(*Reconciler)
+	ctrl = newController(ctx, configMapWatcher, &clock.RealClock{}, opts...)
 
-	cms := append([]*corev1.ConfigMap{{
+	for _, cfg := range []*corev1.ConfigMap{{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      config.DomainConfigName,
 			Namespace: system.Namespace(),
@@ -176,53 +113,54 @@ func newTestSetup(t *testing.T, configs ...*corev1.ConfigMap) (
 			Name:      network.ConfigName,
 			Namespace: system.Namespace(),
 		},
-		Data: map[string]string{},
 	}, {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      gc.ConfigName,
 			Namespace: system.Namespace(),
 		},
-		Data: map[string]string{},
-	}}, configs...)
-
-	for _, cfg := range cms {
+	}, {
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfgmap.FeaturesConfigName,
+			Namespace: system.Namespace(),
+		},
+	}} {
 		configMapWatcher.OnChange(cfg)
 	}
-	return
+
+	// The Reconciler won't do any work until it becomes the leader.
+	if la, ok := ctrl.Reconciler.(reconciler.LeaderAware); ok {
+		la.Promote(reconciler.UniversalBucket(), func(reconciler.Bucket, types.NamespacedName) {})
+	}
+
+	return ctx, informers, ctrl, configMapWatcher, cf
 }
 
-func getRouteIngressFromClient(ctx context.Context, t *testing.T, route *v1alpha1.Route) *netv1alpha1.Ingress {
+func getRouteIngressFromClient(ctx context.Context, t *testing.T, route *v1.Route) *v1alpha1.Ingress {
+	t.Helper()
 	opts := metav1.ListOptions{
-		LabelSelector: labels.Set(map[string]string{
+		LabelSelector: labels.SelectorFromSet(labels.Set{
 			serving.RouteLabelKey:          route.Name,
 			serving.RouteNamespaceLabelKey: route.Namespace,
-		}).AsSelector().String(),
+		}).String(),
 	}
-	ingresses, err := fakeservingclient.Get(ctx).NetworkingV1alpha1().Ingresses(route.Namespace).List(opts)
+	ingresses, err := fakenetworkingclient.Get(ctx).NetworkingV1alpha1().Ingresses(route.Namespace).List(ctx, opts)
 	if err != nil {
 		t.Errorf("Ingress.Get(%v) = %v", opts, err)
 	}
 
 	if len(ingresses.Items) != 1 {
-		t.Errorf("Ingress.Get(%v), expect 1 instance, but got %d", opts, len(ingresses.Items))
+		t.Fatalf("Ingress.Get(%v), expect 1 instance, but got %d", opts, len(ingresses.Items))
 	}
 
 	return &ingresses.Items[0]
 }
-func getCertificateFromClient(t *testing.T, ctx context.Context, desired *netv1alpha1.Certificate) *netv1alpha1.Certificate {
-	created, err := fakeservingclient.Get(ctx).NetworkingV1alpha1().Certificates(desired.Namespace).Get(desired.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Errorf("Certificates(%s).Get(%s) = %v", desired.Namespace, desired.Name, err)
-	}
-	return created
-}
 
-func addResourcesToInformers(t *testing.T, ctx context.Context, route *v1alpha1.Route) {
+func addRouteToInformers(ctx context.Context, t *testing.T, route *v1.Route) {
 	t.Helper()
 
 	ns := route.Namespace
 
-	route, err := fakeservingclient.Get(ctx).ServingV1alpha1().Routes(ns).Get(route.Name, metav1.GetOptions{})
+	route, err := fakeservingclient.Get(ctx).ServingV1().Routes(ns).Get(ctx, route.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("Route.Get(%v) = %v", route.Name, err)
 	}
@@ -237,31 +175,29 @@ func addResourcesToInformers(t *testing.T, ctx context.Context, route *v1alpha1.
 
 // Test the only revision in the route is in Reserve (inactive) serving status.
 func TestCreateRouteForOneReserveRevision(t *testing.T) {
-	ctx, _, reconciler, _, cf := newTestReconciler(t)
+	ctx, _, ctl, _, cf := newTestSetup(t)
 	defer cf()
 
-	fakeRecorder := reconciler.Base.Recorder.(*record.FakeRecorder)
+	fakeRecorder := controller.GetEventRecorder(ctx).(*record.FakeRecorder)
 
-	// An inactive revision
-	rev := getTestRevision("test-rev")
-	rev.Status.MarkActiveFalse("NoTraffic", "no message")
+	// An inactive revision.
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady,
+		MarkInactive("NoTraffic", "no message"))
 
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(rev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
 
 	// A route targeting the revision
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
-			RevisionName:      "test-rev",
-			ConfigurationName: "test-config",
-			Percent:           ptr.Int64(100),
-		},
-	}))
-	fakeservingclient.Get(ctx).ServingV1alpha1().Routes(testNamespace).Create(route)
+	route := Route(testNamespace, "test-route", WithSpecTraffic(v1.TrafficTarget{
+		RevisionName:      "test-rev",
+		ConfigurationName: "test-config",
+		Percent:           ptr.Int64(100),
+	}), WithRouteLabel(map[string]string{"route": "test-route"}))
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
 
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(ctx, t, route)
 
@@ -272,24 +208,25 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 		"route":                        "test-route",
 	}
 	if diff := cmp.Diff(expectedLabels, ci.Labels); diff != "" {
-		t.Errorf("Unexpected label diff (-want +got): %v", diff)
+		t.Errorf("Unexpected label diff (-want +got):\n%s", diff)
 	}
 
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
-	expectedSpec := netv1alpha1.IngressSpec{
-		Visibility: netv1alpha1.IngressVisibilityExternalIP,
-		TLS:        []netv1alpha1.IngressTLS{},
-		Rules: []netv1alpha1.IngressRule{{
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
 			Hosts: []string{
-				"test-route.test.svc.cluster.local",
-				domain,
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
-							ServiceName:      rev.Status.ServiceName,
+							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
 						},
 						Percent: 100,
@@ -300,23 +237,43 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+		}, {
+			Hosts: []string{
+				domain,
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  "test-rev",
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
 		}},
 	}
 	if diff := cmp.Diff(expectedSpec, ci.Spec); diff != "" {
-		t.Errorf("Unexpected rule spec diff (-want +got): %s", diff)
+		t.Error("Unexpected rule spec diff (-want +got):", diff)
 	}
 
 	// Update ingress loadbalancer to trigger placeholder service creation.
-	ci.Status = netv1alpha1.IngressStatus{
-		LoadBalancer: &netv1alpha1.LoadBalancerStatus{
-			Ingress: []netv1alpha1.LoadBalancerIngressStatus{{
+	ci.Status = v1alpha1.IngressStatus{
+		DeprecatedLoadBalancer: &v1alpha1.LoadBalancerStatus{
+			Ingress: []v1alpha1.LoadBalancerIngressStatus{{
 				DomainInternal: "test-domain",
 			}},
 		},
 	}
 	fakeingressinformer.Get(ctx).Informer().GetIndexer().Update(ci)
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	// Look for the events. Events are delivered asynchronously so we need to use
 	// hooks here. Each hook tests for a specific event.
@@ -327,7 +284,7 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 			t.Errorf("<-Events = %s, wanted %s", got, want)
 		}
 	case <-time.After(3 * time.Second):
-		t.Error("timed out waiting for expected events.")
+		t.Error("Timed out waiting for expected events.")
 	}
 	select {
 	case got := <-fakeRecorder.Events:
@@ -336,64 +293,68 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 			t.Errorf("<-Events = %s, wanted prefix %s", got, wantPrefix)
 		}
 	case <-time.After(3 * time.Second):
-		t.Error("timed out waiting for expected events.")
+		t.Error("Timed out waiting for expected events.")
 	}
 }
 
 func TestCreateRouteWithMultipleTargets(t *testing.T) {
-	ctx, _, reconciler, _, cf := newTestReconciler(t)
-	defer cf()
-	// A standalone revision
-	rev := getTestRevision("test-rev")
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(rev)
+	ctx, informers, ctl, _, cf := newTestSetup(t)
+	wicb, err := controller.RunInformers(ctx.Done(), informers...)
+	if err != nil {
+		t.Fatal("Error starting informers:", err)
+	}
+	defer func() {
+		cf()
+		wicb()
+	}()
+	// A standalone revision.
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
 
 	// A configuration and associated revision. Normally the revision would be
 	// created by the configuration reconciler.
-	config := getTestConfiguration()
-	cfgrev := getTestRevisionForConfig(config)
+	config := testConfiguration()
+	cfgrev := testRevision()
 	config.Status.SetLatestCreatedRevisionName(cfgrev.Name)
 	config.Status.SetLatestReadyRevisionName(cfgrev.Name)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Configurations(testNamespace).Create(config)
+	fakeservingclient.Get(ctx).ServingV1().Configurations(testNamespace).Create(ctx, config, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakecfginformer.Get(ctx).Informer().GetIndexer().Add(config)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(cfgrev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, cfgrev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(cfgrev)
 
 	// A route targeting both the config and standalone revision.
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+	route := Route(testNamespace, "test-route", WithSpecTraffic(
+		v1.TrafficTarget{
 			ConfigurationName: config.Name,
 			Percent:           ptr.Int64(90),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			RevisionName: rev.Name,
 			Percent:      ptr.Int64(10),
-		},
-	}))
-	fakeservingclient.Get(ctx).ServingV1alpha1().Routes(testNamespace).Create(route)
+		}))
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer.
 	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
 
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(ctx, t, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
-	expectedSpec := netv1alpha1.IngressSpec{
-		Visibility: netv1alpha1.IngressVisibilityExternalIP,
-		TLS:        []netv1alpha1.IngressTLS{},
-		Rules: []netv1alpha1.IngressRule{{
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
 			Hosts: []string{
-				"test-route.test.svc.cluster.local",
-				domain,
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
-							ServiceName:      cfgrev.Status.ServiceName,
+							ServiceName:      cfgrev.Name,
 							ServicePort:      intstr.FromInt(80),
 						},
 						Percent: 90,
@@ -402,9 +363,9 @@ func TestCreateRouteWithMultipleTargets(t *testing.T) {
 							"Knative-Serving-Namespace": testNamespace,
 						},
 					}, {
-						IngressBackend: netv1alpha1.IngressBackend{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
-							ServiceName:      rev.Status.ServiceName,
+							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
 						},
 						Percent: 10,
@@ -415,73 +376,102 @@ func TestCreateRouteWithMultipleTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{
+				domain,
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 90,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 10,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}},
 	}
 
 	if diff := cmp.Diff(expectedSpec, ci.Spec); diff != "" {
-		t.Errorf("Unexpected rule spec diff (-want +got): %v", diff)
+		t.Error("Unexpected rule spec diff (-want +got):", diff)
 	}
 }
 
 // Test one out of multiple target revisions is in Reserve serving state.
 func TestCreateRouteWithOneTargetReserve(t *testing.T) {
-	ctx, _, reconciler, _, cf := newTestReconciler(t)
+	ctx, _, ctl, _, cf := newTestSetup(t)
 	defer cf()
 	// A standalone inactive revision
-	rev := getTestRevision("test-rev")
-	rev.Status.MarkActiveFalse("NoTraffic", "no message")
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady,
+		MarkInactive("NoTraffic", "no message"))
 
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(rev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
 
 	// A configuration and associated revision. Normally the revision would be
 	// created by the configuration reconciler.
-	config := getTestConfiguration()
-	cfgrev := getTestRevisionForConfig(config)
+	config := testConfiguration()
+	cfgrev := testRevision()
 	config.Status.SetLatestCreatedRevisionName(cfgrev.Name)
 	config.Status.SetLatestReadyRevisionName(cfgrev.Name)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Configurations(testNamespace).Create(config)
+	fakeservingclient.Get(ctx).ServingV1().Configurations(testNamespace).Create(ctx, config, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakecfginformer.Get(ctx).Informer().GetIndexer().Add(config)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(cfgrev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, cfgrev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(cfgrev)
 
 	// A route targeting both the config and standalone revision
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+	route := Route(testNamespace, "test-route", WithSpecTraffic(
+		v1.TrafficTarget{
 			ConfigurationName: config.Name,
 			Percent:           ptr.Int64(90),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			RevisionName:      rev.Name,
 			ConfigurationName: "test-config",
 			Percent:           ptr.Int64(10),
-		},
-	}))
-	fakeservingclient.Get(ctx).ServingV1alpha1().Routes(testNamespace).Create(route)
+		}))
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
 
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(ctx, t, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
-	expectedSpec := netv1alpha1.IngressSpec{
-		Visibility: netv1alpha1.IngressVisibilityExternalIP,
-		TLS:        []netv1alpha1.IngressTLS{},
-		Rules: []netv1alpha1.IngressRule{{
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
 			Hosts: []string{
-				"test-route.test.svc.cluster.local",
-				domain,
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
-							ServiceName:      cfgrev.Status.ServiceName,
+							ServiceName:      cfgrev.Name,
 							ServicePort:      intstr.FromInt(80),
 						},
 						Percent: 90,
@@ -490,9 +480,9 @@ func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 							"Knative-Serving-Namespace": testNamespace,
 						},
 					}, {
-						IngressBackend: netv1alpha1.IngressBackend{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
-							ServiceName:      rev.Status.ServiceName,
+							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
 						},
 						Percent: 10,
@@ -503,95 +493,114 @@ func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{
+				domain,
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 90,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 10,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}},
 	}
 	if diff := cmp.Diff(expectedSpec, ci.Spec); diff != "" {
-		t.Errorf("Unexpected rule spec diff (-want +got): %v", diff)
+		t.Error("Unexpected rule spec diff (-want +got):", diff)
 	}
 }
 
 func TestCreateRouteWithDuplicateTargets(t *testing.T) {
-	ctx, _, reconciler, _, cf := newTestReconciler(t)
+	ctx, _, ctl, _, cf := newTestSetup(t)
 	defer cf()
 
 	// A standalone revision
-	rev := getTestRevision("test-rev")
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(rev)
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady, WithK8sServiceName)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
 
 	// A configuration and associated revision. Normally the revision would be
 	// created by the configuration reconciler.
-	config := getTestConfiguration()
-	cfgrev := getTestRevisionForConfig(config)
+	config := testConfiguration()
+	cfgrev := testRevision()
 	config.Status.SetLatestCreatedRevisionName(cfgrev.Name)
 	config.Status.SetLatestReadyRevisionName(cfgrev.Name)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Configurations(testNamespace).Create(config)
+	fakeservingclient.Get(ctx).ServingV1().Configurations(testNamespace).Create(ctx, config, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakecfginformer.Get(ctx).Informer().GetIndexer().Add(config)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(cfgrev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, cfgrev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(cfgrev)
 
 	// A route with duplicate targets. These will be deduped.
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+	route := Route(testNamespace, "test-route", WithSpecTraffic(
+		v1.TrafficTarget{
 			ConfigurationName: "test-config",
 			Percent:           ptr.Int64(30),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			ConfigurationName: "test-config",
 			Percent:           ptr.Int64(20),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(10),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(5),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			Tag:          "test-revision-1",
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(10),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			Tag:          "test-revision-1",
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(10),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			Tag:          "test-revision-2",
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(15),
-		},
-	}))
-	fakeservingclient.Get(ctx).ServingV1alpha1().Routes(testNamespace).Create(route)
+		}))
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
 
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(ctx, t, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
-	expectedSpec := netv1alpha1.IngressSpec{
-		Visibility: netv1alpha1.IngressVisibilityExternalIP,
-		TLS:        []netv1alpha1.IngressTLS{},
-		Rules: []netv1alpha1.IngressRule{{
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
 			Hosts: []string{
-				"test-route.test.svc.cluster.local",
-				domain,
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      cfgrev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -602,7 +611,7 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 							"Knative-Serving-Namespace": testNamespace,
 						},
 					}, {
-						IngressBackend: netv1alpha1.IngressBackend{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -615,16 +624,70 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
 		}, {
 			Hosts: []string{
-				"test-revision-1-test-route.test.svc.cluster.local",
+				domain,
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
+		}, {
+			Hosts: []string{
+				"test-revision-1-test-route.test",
+				"test-revision-1-test-route.test.svc",
+				pkgnet.GetServiceHostname("test-revision-1-test-route", "test"),
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      "test-rev",
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{
 				"test-revision-1-test-route.test.test-domain.dev",
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      "test-rev",
 							ServicePort:      intstr.FromInt(80),
@@ -637,16 +700,17 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}, {
 			Hosts: []string{
-				"test-revision-2-test-route.test.svc.cluster.local",
-				"test-revision-2-test-route.test.test-domain.dev",
+				"test-revision-2-test-route.test",
+				"test-revision-2-test-route.test.svc",
+				pkgnet.GetServiceHostname("test-revision-2-test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      "test-rev",
 							ServicePort:      intstr.FromInt(80),
@@ -659,72 +723,89 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{
+				"test-revision-2-test-route.test.test-domain.dev",
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      "test-rev",
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}},
 	}
 
 	if diff := cmp.Diff(expectedSpec, ci.Spec); diff != "" {
-		fmt.Printf("%+v\n", ci.Spec)
-		t.Errorf("Unexpected rule spec diff (-want +got): %v", diff)
+		t.Error("Unexpected rule spec diff (-want +got):", diff)
 	}
 }
 
 func TestCreateRouteWithNamedTargets(t *testing.T) {
-	ctx, _, reconciler, _, cf := newTestReconciler(t)
+	ctx, _, ctl, _, cf := newTestSetup(t)
 	defer cf()
 	// A standalone revision
-	rev := getTestRevision("test-rev")
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(rev)
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady, WithK8sServiceName)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
 
 	// A configuration and associated revision. Normally the revision would be
 	// created by the configuration reconciler.
-	config := getTestConfiguration()
-	cfgrev := getTestRevisionForConfig(config)
+	config := testConfiguration()
+	cfgrev := testRevision()
 	config.Status.SetLatestCreatedRevisionName(cfgrev.Name)
 	config.Status.SetLatestReadyRevisionName(cfgrev.Name)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Configurations(testNamespace).Create(config)
+	fakeservingclient.Get(ctx).ServingV1().Configurations(testNamespace).Create(ctx, config, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakecfginformer.Get(ctx).Informer().GetIndexer().Add(config)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespace).Create(cfgrev)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, cfgrev, metav1.CreateOptions{})
 	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(cfgrev)
 
 	// A route targeting both the config and standalone revision with named
 	// targets
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+	route := Route(testNamespace, "test-route", WithSpecTraffic(
+		v1.TrafficTarget{
 			Tag:          "foo",
 			RevisionName: "test-rev",
 			Percent:      ptr.Int64(50),
-		},
-	}, v1alpha1.TrafficTarget{
-		TrafficTarget: v1.TrafficTarget{
+		}, v1.TrafficTarget{
 			Tag:               "bar",
 			ConfigurationName: "test-config",
 			Percent:           ptr.Int64(50),
-		},
-	}))
+		}))
 
-	fakeservingclient.Get(ctx).ServingV1alpha1().Routes(testNamespace).Create(route)
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
 
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(ctx, t, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
-	expectedSpec := netv1alpha1.IngressSpec{
-		Visibility: netv1alpha1.IngressVisibilityExternalIP,
-		TLS:        []netv1alpha1.IngressTLS{},
-		Rules: []netv1alpha1.IngressRule{{
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
 			Hosts: []string{
-				"test-route.test.svc.cluster.local",
-				domain,
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -735,7 +816,7 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 							"Knative-Serving-Namespace": testNamespace,
 						},
 					}, {
-						IngressBackend: netv1alpha1.IngressBackend{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      cfgrev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -748,16 +829,47 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{domain},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}, {
 			Hosts: []string{
-				"bar-test-route.test.svc.cluster.local",
-				"bar-test-route.test.test-domain.dev",
+				"bar-test-route.test",
+				"bar-test-route.test.svc",
+				pkgnet.GetServiceHostname("bar-test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      cfgrev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -770,16 +882,36 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{"bar-test-route.test.test-domain.dev"},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}, {
 			Hosts: []string{
-				"foo-test-route.test.svc.cluster.local",
-				"foo-test-route.test.test-domain.dev",
+				"foo-test-route.test",
+				"foo-test-route.test.svc",
+				pkgnet.GetServiceHostname("foo-test-route", "test"),
 			},
-			HTTP: &netv1alpha1.HTTPIngressRuleValue{
-				Paths: []netv1alpha1.HTTPIngressPath{{
-					Splits: []netv1alpha1.IngressBackendSplit{{
-						IngressBackend: netv1alpha1.IngressBackend{
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
 							ServiceNamespace: testNamespace,
 							ServiceName:      rev.Name,
 							ServicePort:      intstr.FromInt(80),
@@ -792,99 +924,479 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 					}},
 				}},
 			},
-			Visibility: netv1alpha1.IngressVisibilityExternalIP,
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{"foo-test-route.test.test-domain.dev"},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
+		}},
+	}
+
+	if !cmp.Equal(expectedSpec, ci.Spec) {
+		t.Error("Unexpected rule spec diff (-want +got):", cmp.Diff(expectedSpec, ci.Spec))
+	}
+}
+
+func TestCreateRouteWithNamedTargetsAndTagBasedRouting(t *testing.T) {
+	ctx, _, ctl, watcher, cf := newTestSetup(t)
+	defer cf()
+
+	watcher.OnChange(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfgmap.FeaturesConfigName,
+			Namespace: system.Namespace(),
+		},
+		Data: map[string]string{
+			"tag-header-based-routing": "enabled",
+		},
+	})
+	// A standalone revision
+	rev := Revision(testNamespace, "test-rev", MarkRevisionReady, WithK8sServiceName)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, rev, metav1.CreateOptions{})
+	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(rev)
+
+	// A configuration and associated revision. Normally the revision would be
+	// created by the configuration reconciler.
+	config := testConfiguration()
+	cfgrev := testRevision()
+	config.Status.SetLatestCreatedRevisionName(cfgrev.Name)
+	config.Status.SetLatestReadyRevisionName(cfgrev.Name)
+	fakeservingclient.Get(ctx).ServingV1().Configurations(testNamespace).Create(ctx, config, metav1.CreateOptions{})
+	// Since Reconcile looks in the lister, we need to add it to the informer
+	fakecfginformer.Get(ctx).Informer().GetIndexer().Add(config)
+	fakeservingclient.Get(ctx).ServingV1().Revisions(testNamespace).Create(ctx, cfgrev, metav1.CreateOptions{})
+	fakerevisioninformer.Get(ctx).Informer().GetIndexer().Add(cfgrev)
+
+	// A route targeting both the config and standalone revision with named
+	// targets
+	route := Route(testNamespace, "test-route", WithSpecTraffic(
+		v1.TrafficTarget{
+			Tag:          "foo",
+			RevisionName: "test-rev",
+			Percent:      ptr.Int64(50),
+		}, v1.TrafficTarget{
+			Tag:               "bar",
+			ConfigurationName: "test-config",
+			Percent:           ptr.Int64(50),
+		}))
+
+	fakeservingclient.Get(ctx).ServingV1().Routes(testNamespace).Create(ctx, route, metav1.CreateOptions{})
+	// Since Reconcile looks in the lister, we need to add it to the informer
+	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
+	ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route))
+
+	ci := getRouteIngressFromClient(ctx, t, route)
+	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
+	expectedSpec := v1alpha1.IngressSpec{
+		TLS: []v1alpha1.IngressTLS{},
+		Rules: []v1alpha1.IngressRule{{
+			Hosts: []string{
+				"test-route.test",
+				"test-route.test.svc",
+				pkgnet.GetServiceHostname("test-route", "test"),
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Headers: map[string]v1alpha1.HeaderMatch{
+						network.TagHeaderName: {
+							Exact: "bar",
+						},
+					},
+					Splits: []v1alpha1.IngressBackendSplit{
+						{
+							IngressBackend: v1alpha1.IngressBackend{
+								ServiceNamespace: "test",
+								ServiceName:      "p-deadbeef",
+								ServicePort:      intstr.IntOrString{IntVal: 80},
+							},
+							Percent: 100,
+							AppendHeaders: map[string]string{
+								"Knative-Serving-Namespace": "test",
+								"Knative-Serving-Revision":  "p-deadbeef",
+							},
+						},
+					},
+				}, {
+					Headers: map[string]v1alpha1.HeaderMatch{
+						network.TagHeaderName: {
+							Exact: "foo",
+						},
+					},
+					Splits: []v1alpha1.IngressBackendSplit{
+						{
+							IngressBackend: v1alpha1.IngressBackend{
+								ServiceNamespace: "test",
+								ServiceName:      "test-rev",
+								ServicePort:      intstr.IntOrString{IntVal: 80},
+							},
+							Percent: 100,
+							AppendHeaders: map[string]string{
+								"Knative-Serving-Namespace": "test",
+								"Knative-Serving-Revision":  "test-rev",
+							},
+						},
+					},
+				}, {
+					AppendHeaders: map[string]string{
+						network.DefaultRouteHeaderName: "true",
+					},
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{domain},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Headers: map[string]v1alpha1.HeaderMatch{
+						network.TagHeaderName: {
+							Exact: "bar",
+						},
+					},
+					Splits: []v1alpha1.IngressBackendSplit{
+						{
+							IngressBackend: v1alpha1.IngressBackend{
+								ServiceNamespace: "test",
+								ServiceName:      "p-deadbeef",
+								ServicePort:      intstr.IntOrString{IntVal: 80},
+							},
+							Percent: 100,
+							AppendHeaders: map[string]string{
+								"Knative-Serving-Namespace": "test",
+								"Knative-Serving-Revision":  "p-deadbeef",
+							},
+						},
+					},
+				}, {
+					Headers: map[string]v1alpha1.HeaderMatch{
+						network.TagHeaderName: {
+							Exact: "foo",
+						},
+					},
+					Splits: []v1alpha1.IngressBackendSplit{
+						{
+							IngressBackend: v1alpha1.IngressBackend{
+								ServiceNamespace: "test",
+								ServiceName:      "test-rev",
+								ServicePort:      intstr.IntOrString{IntVal: 80},
+							},
+							Percent: 100,
+							AppendHeaders: map[string]string{
+								"Knative-Serving-Namespace": "test",
+								"Knative-Serving-Revision":  "test-rev",
+							},
+						},
+					},
+				}, {
+					AppendHeaders: map[string]string{
+						network.DefaultRouteHeaderName: "true",
+					},
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}, {
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 50,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
+		}, {
+			Hosts: []string{
+				"bar-test-route.test",
+				"bar-test-route.test.svc",
+				pkgnet.GetServiceHostname("bar-test-route", "test"),
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+					AppendHeaders: map[string]string{
+						network.TagHeaderName: "bar",
+					},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{
+				"bar-test-route.test.test-domain.dev",
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      cfgrev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  cfgrev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+					AppendHeaders: map[string]string{
+						network.TagHeaderName: "bar",
+					},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
+		}, {
+			Hosts: []string{
+				"foo-test-route.test",
+				"foo-test-route.test.svc",
+				pkgnet.GetServiceHostname("foo-test-route", "test"),
+			},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+					AppendHeaders: map[string]string{
+						network.TagHeaderName: "foo",
+					},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityClusterLocal,
+		}, {
+			Hosts: []string{"foo-test-route.test.test-domain.dev"},
+			HTTP: &v1alpha1.HTTPIngressRuleValue{
+				Paths: []v1alpha1.HTTPIngressPath{{
+					Splits: []v1alpha1.IngressBackendSplit{{
+						IngressBackend: v1alpha1.IngressBackend{
+							ServiceNamespace: testNamespace,
+							ServiceName:      rev.Name,
+							ServicePort:      intstr.FromInt(80),
+						},
+						Percent: 100,
+						AppendHeaders: map[string]string{
+							"Knative-Serving-Revision":  rev.Name,
+							"Knative-Serving-Namespace": testNamespace,
+						},
+					}},
+					AppendHeaders: map[string]string{
+						network.TagHeaderName: "foo",
+					},
+				}},
+			},
+			Visibility: v1alpha1.IngressVisibilityExternalIP,
 		}},
 	}
 
 	if diff := cmp.Diff(expectedSpec, ci.Spec); diff != "" {
-		fmt.Printf("%+v\n", ci.Spec)
-		t.Errorf("Unexpected rule spec diff (-want +got): %v", diff)
+		t.Error("Unexpected rule spec diff (-want +got):", diff)
 	}
 }
 
 func TestUpdateDomainConfigMap(t *testing.T) {
-	ctx, _, reconciler, watcher, cf := newTestReconciler(t)
-	defer cf()
-	route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{}))
-	routeClient := fakeservingclient.Get(ctx).ServingV1alpha1().Routes(route.Namespace)
-
-	// Create a route.
-	fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
-	routeClient.Create(route)
-	reconciler.Reconcile(context.Background(), KeyOrDie(route))
-	addResourcesToInformers(t, ctx, route)
-
-	route.ObjectMeta.Labels = map[string]string{"app": "prod"}
+	templateCM := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      config.DomainConfigName,
+			Namespace: system.Namespace(),
+		},
+		Data: map[string]string{
+			defaultDomainSuffix: "",
+			"mytestdomain.com":  "selector:\n  app: prod",
+		},
+	}
 
 	// Test changes in domain config map. Routes should get updated appropriately.
 	expectations := []struct {
-		apply                func()
+		apply                func(*v1.Route, *configmap.ManualWatcher)
 		expectedDomainSuffix string
 	}{{
 		expectedDomainSuffix: prodDomainSuffix,
-		apply:                func() {},
+		apply:                func(*v1.Route, *configmap.ManualWatcher) {},
 	}, {
 		expectedDomainSuffix: "mytestdomain.com",
-		apply: func() {
-			domainConfig := corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      config.DomainConfigName,
-					Namespace: system.Namespace(),
-				},
-				Data: map[string]string{
-					defaultDomainSuffix: "",
-					"mytestdomain.com":  "selector:\n  app: prod",
-				},
-			}
-			watcher.OnChange(&domainConfig)
+		apply: func(_ *v1.Route, watcher *configmap.ManualWatcher) {
+			watcher.OnChange(&templateCM)
 		},
 	}, {
 		expectedDomainSuffix: "newdefault.net",
-		apply: func() {
-			domainConfig := corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      config.DomainConfigName,
-					Namespace: system.Namespace(),
-				},
-				Data: map[string]string{
-					"newdefault.net":   "",
-					"mytestdomain.com": "selector:\n  app: prod",
-				},
+		apply: func(r *v1.Route, watcher *configmap.ManualWatcher) {
+			templateCM.Data = map[string]string{
+				"newdefault.net":   "",
+				"mytestdomain.com": "selector:\n  app: prod",
 			}
-			watcher.OnChange(&domainConfig)
-			route.Labels = make(map[string]string)
+			watcher.OnChange(&templateCM)
+			r.Labels = nil
 		},
 	}, {
 		// When no domain with an open selector is specified, we fallback
 		// on the default of example.com.
 		expectedDomainSuffix: config.DefaultDomain,
-		apply: func() {
-			domainConfig := corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      config.DomainConfigName,
-					Namespace: system.Namespace(),
-				},
-				Data: map[string]string{
-					"mytestdomain.com": "selector:\n  app: prod",
-				},
+		apply: func(r *v1.Route, watcher *configmap.ManualWatcher) {
+			templateCM.Data = map[string]string{
+				"mytestdomain.com": "selector:\n  app: prod",
 			}
-			watcher.OnChange(&domainConfig)
-			route.Labels = make(map[string]string)
+			watcher.OnChange(&templateCM)
+			r.Labels = nil
 		},
 	}}
 
-	for _, expectation := range expectations {
-		t.Run(expectation.expectedDomainSuffix, func(t *testing.T) {
-			expectation.apply()
-			fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
-			routeClient.Update(route)
-			reconciler.Reconcile(context.Background(), KeyOrDie(route))
-			addResourcesToInformers(t, ctx, route)
+	for _, tc := range expectations {
+		t.Run(tc.expectedDomainSuffix, func(t *testing.T) {
+			ctx, ifs, ctl, watcher, cf := newTestSetup(t)
+			waitInformers, err := controller.RunInformers(ctx.Done(), ifs...)
+			if err != nil {
+				t.Fatal("Failed to start informers:", err)
+			}
+			defer func() {
+				cf()
+				waitInformers()
+			}()
+			route := Route(testNamespace, "test", WithRouteGeneration(1982),
+				WithRouteLabel(map[string]string{"app": "prod"}))
+			routeClient := fakeservingclient.Get(ctx).ServingV1().Routes(route.Namespace)
 
-			route, _ = routeClient.Get(route.Name, metav1.GetOptions{})
-			expectedDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, expectation.expectedDomainSuffix)
-			if route.Status.URL.Host != expectedDomain {
-				t.Errorf("Expected domain %q but saw %q", expectedDomain, route.Status.URL.Host)
+			// Create a route.
+			fakerouteinformer.Get(ctx).Informer().GetIndexer().Add(route)
+			routeClient.Create(ctx, route, metav1.CreateOptions{})
+			if err := ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route)); err != nil {
+				t.Fatal("Reconcile() =", err)
+			}
+			addRouteToInformers(ctx, t, route)
+
+			// Wait initial reconcile to finish.
+			rl := fakerouteinformer.Get(ctx).Lister().Routes(route.Namespace)
+			if err := wait.PollImmediate(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+				r, err := rl.Get(route.Name)
+				if err != nil {
+					return false, err
+				}
+				return !cmp.Equal(r.Status, route.Status) && r.Generation == r.Status.ObservedGeneration, nil
+			}); err != nil {
+				t.Fatal("Failed to see route initial reconcile propagation:", err)
+			}
+
+			// Ensure we're operating on a copy, to make sure the update below
+			// generates an actual diff. Otherwise the value in the
+			// fake cache is going to be changed. Now, this update sometimes races with
+			// the CM update and since the update below is a noop (the same object
+			// is applied), nothing happens and the test fails (for one of the tests).
+			// So we'll retry the operation several times.
+			timeout := time.After(10 * time.Second)
+			wantDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, tc.expectedDomainSuffix)
+			for i := 1; ; i++ {
+				select {
+				case <-timeout:
+					t.Fatal("Timed out trying to see the propagation")
+				default:
+					t.Log("Starting iteration", i)
+				}
+				route, _ := rl.Get(route.Name)
+				route = route.DeepCopy()
+				route.Generation++
+				tc.apply(route, watcher)
+				if _, err := routeClient.Update(ctx, route, metav1.UpdateOptions{}); err != nil {
+					t.Fatal("Route.Update() =", err)
+				}
+
+				// Ensure we have the proper version in the informers.
+				if err := wait.PollImmediate(10*time.Millisecond, 3*time.Second, func() (bool, error) {
+					r, err := rl.Get(route.Name)
+					return r != nil && r.Generation == route.Generation, err
+				}); err != nil {
+					t.Fatal("Failed to see informers get the new Route version:", err)
+				}
+
+				// Now that we know the exact version the reconciler is going to see in the
+				// informers, let's reconcile.
+				if err := ctl.Reconciler.Reconcile(context.Background(), KeyOrDie(route)); err != nil {
+					t.Fatal("Reconcile() =", err)
+				}
+
+				var gotDomain string
+				if err := wait.PollImmediate(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+					r, err := routeClient.Get(ctx, route.Name, metav1.GetOptions{})
+					if err != nil {
+						return false, err
+					}
+					// Wait for the object to reconcile and the domain to propagate.
+					if r.Status.ObservedGeneration != route.Generation && r.Status.URL == nil {
+						return false, nil
+					}
+					gotDomain = r.Status.URL.Host
+					return gotDomain == wantDomain, nil
+				}); err != nil {
+					t.Logf("Failed to see route domain propagation, got %s, want %s: %v", gotDomain, wantDomain, err)
+				} else {
+					t.Log("Success")
+					break
+				}
 			}
 		})
 	}
@@ -948,55 +1460,65 @@ func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
 	for _, test := range tests {
 		test := test
 		t.Run(test.expectedDomainSuffix, func(t *testing.T) {
-			ctx, informers, ctrl, _, watcher, cf := newTestSetup(t)
+			ctx, informers, ctrl, watcher, cf := newTestSetup(t)
 
 			grp := errgroup.Group{}
 
 			servingClient := fakeservingclient.Get(ctx)
-			h := NewHooks()
-
-			// Check for Ingress created as a signal that syncHandler ran
-			h.OnUpdate(&servingClient.Fake, "routes", func(obj runtime.Object) HookResult {
-				rt := obj.(*v1alpha1.Route)
-				t.Logf("route updated: %q", rt.Name)
-
-				expectedDomain := fmt.Sprintf("%s.%s.%s", rt.Name, rt.Namespace, test.expectedDomainSuffix)
-				if rt.Status.URL.Host != expectedDomain {
-					t.Logf("Expected domain %q but saw %q", expectedDomain, rt.Status.URL.Host)
-					return HookIncomplete
-				}
-
-				return HookComplete
-			})
+			routeInformer := fakerouteinformer.Get(ctx)
 
 			waitInformers, err := controller.RunInformers(ctx.Done(), informers...)
 			if err != nil {
-				t.Fatalf("Failed to start informers: %v", err)
+				t.Fatal("Failed to start informers:", err)
 			}
 			defer func() {
 				cf()
 				if err := grp.Wait(); err != nil {
-					t.Errorf("Wait() = %v", err)
+					t.Error("Wait() =", err)
 				}
 				waitInformers()
 			}()
 
 			if err := watcher.Start(ctx.Done()); err != nil {
-				t.Fatalf("failed to start configuration manager: %v", err)
+				t.Fatal("failed to start configuration manager:", err)
 			}
 
 			grp.Go(func() error { return ctrl.Run(1, ctx.Done()) })
 
 			// Create a route.
-			route := getTestRouteWithTrafficTargets(WithSpecTraffic(v1alpha1.TrafficTarget{}))
-			route.Labels = map[string]string{"app": "prod"}
+			route := Route(testNamespace, "test-route",
+				WithRouteLabel(map[string]string{"app": "prod"}), WithRouteGeneration(1))
 
-			servingClient.ServingV1alpha1().Routes(route.Namespace).Create(route)
+			created, err := servingClient.ServingV1().Routes(route.Namespace).Create(ctx, route, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatal("Failed to create route", err)
+			}
+			routeInformer.Informer().GetIndexer().Add(created)
+
+			rl := routeInformer.Lister()
+			if err := wait.PollImmediate(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+				r, err := rl.Routes(route.Namespace).Get(route.Name)
+				if err != nil {
+					return false, err
+				}
+				// Once we see an observed generation, we know the route got initially reconciled.
+				return r.Status.ObservedGeneration == 1, nil
+			}); err != nil {
+				t.Fatal("Failed to see route creation propagation:", err)
+			}
 
 			test.doThings(watcher)
 
-			if err := h.WaitForHooks(3 * time.Second); err != nil {
-				t.Error(err)
+			expectedDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, test.expectedDomainSuffix)
+			if err := wait.PollImmediate(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+				r, err := rl.Routes(route.Namespace).Get(route.Name)
+				if err != nil {
+					return false, err
+				}
+
+				return r.Status.URL != nil && r.Status.URL.Host == expectedDomain, nil
+			}); err != nil {
+				t.Fatal("Failed to see route update propagation:", err)
 			}
 		})
 	}
@@ -1005,7 +1527,7 @@ func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
 func TestRouteDomain(t *testing.T) {
 	route := Route("default", "myapp", WithRouteLabel(map[string]string{"route": "myapp"}), WithRouteAnnotation(map[string]string{"sub": "mysub"}))
 	ctx := context.Background()
-	cfg := ReconcilerTestConfig(false)
+	cfg := reconcilerTestConfig(false)
 	ctx = config.ToContext(ctx, cfg)
 
 	tests := []struct {
@@ -1029,10 +1551,10 @@ func TestRouteDomain(t *testing.T) {
 		Pass:     true,
 		Expected: "myapp.example.com",
 	}, {
-		Name:     "SuperShort",
+		Name:     "Too short", // domain must be at least two segments separated by dots.
 		Template: "{{.Name}}",
-		Pass:     true,
-		Expected: "myapp",
+		Pass:     false,
+		Expected: "",
 	}, {
 		Name:     "Annotations",
 		Template: `{{.Name}}.{{ index .Annotations "sub"}}.{{.Domain}}`,
@@ -1057,6 +1579,62 @@ func TestRouteDomain(t *testing.T) {
 			}
 			if got, want := res, test.Expected; got != want {
 				t.Errorf("DomainNameFromTemplate = %q, want: %q", res, test.Expected)
+			}
+		})
+	}
+}
+
+func TestAutoTLSEnabled(t *testing.T) {
+	tests := []struct {
+		name                  string
+		configAutoTLSEnabled  bool
+		tlsDisabledAnnotation string
+		wantAutoTLSEnabled    bool
+	}{{
+		name:                 "AutoTLS enabled by config, not disabled by annotation",
+		configAutoTLSEnabled: true,
+		wantAutoTLSEnabled:   true,
+	}, {
+		name:                  "AutoTLS enabled by config, disabled by annotation",
+		configAutoTLSEnabled:  true,
+		tlsDisabledAnnotation: "true",
+		wantAutoTLSEnabled:    false,
+	}, {
+		name:                 "AutoTLS disabled by config, not disabled by annotation",
+		configAutoTLSEnabled: false,
+		wantAutoTLSEnabled:   false,
+	}, {
+		name:                  "AutoTLS disabled by config, disabled by annotation",
+		configAutoTLSEnabled:  false,
+		tlsDisabledAnnotation: "true",
+		wantAutoTLSEnabled:    false,
+	}, {
+		name:                  "AutoTLS enabled by config, invalid annotation",
+		configAutoTLSEnabled:  true,
+		tlsDisabledAnnotation: "foo",
+		wantAutoTLSEnabled:    true,
+	}, {
+		name:                  "AutoTLS disabled by config, invalid annotation",
+		configAutoTLSEnabled:  false,
+		tlsDisabledAnnotation: "foo",
+		wantAutoTLSEnabled:    false,
+	}}
+
+	r := Route("test-ns", "test-route")
+	r.Annotations = map[string]string{}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := config.ToContext(context.Background(), &config.Config{
+				Network: &network.Config{
+					AutoTLS: test.configAutoTLSEnabled,
+				},
+			})
+
+			r.Annotations[networking.DisableAutoTLSAnnotationKey] = test.tlsDisabledAnnotation
+
+			if got := autoTLSEnabled(ctx, r); got != test.wantAutoTLSEnabled {
+				t.Errorf("autoTLSEnabled = %t, want %t", got, test.wantAutoTLSEnabled)
 			}
 		})
 	}

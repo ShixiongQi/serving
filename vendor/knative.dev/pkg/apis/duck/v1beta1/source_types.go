@@ -24,14 +24,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"knative.dev/pkg/apis"
-	"knative.dev/pkg/apis/duck"
-	apisv1alpha1 "knative.dev/pkg/apis/v1alpha1"
+	"knative.dev/pkg/apis/duck/ducktypes"
 )
 
-// Source is an Implementable "duck type".
-var _ duck.Implementable = (*Source)(nil)
-
-// +genclient
+// +genduck
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // Source is the minimum resource shape to adhere to the Source Specification.
@@ -51,7 +47,7 @@ type Source struct {
 type SourceSpec struct {
 	// Sink is a reference to an object that will resolve to a domain name or a
 	// URI directly to use as the sink.
-	Sink apisv1alpha1.Destination `json:"sink,omitempty"`
+	Sink Destination `json:"sink,omitempty"`
 
 	// CloudEventOverrides defines overrides to control the output format and
 	// modifications of the event sent to the sink.
@@ -98,10 +94,11 @@ func (ss *SourceStatus) IsReady() bool {
 	return false
 }
 
+// Verify Source resources meet duck contracts.
 var (
-	// Verify Source resources meet duck contracts.
-	_ duck.Populatable = (*Source)(nil)
-	_ apis.Listable    = (*Source)(nil)
+	_ apis.Listable           = (*Source)(nil)
+	_ ducktypes.Implementable = (*Source)(nil)
+	_ ducktypes.Populatable   = (*Source)(nil)
 )
 
 const (
@@ -111,13 +108,13 @@ const (
 )
 
 // GetFullType implements duck.Implementable
-func (*Source) GetFullType() duck.Populatable {
+func (*Source) GetFullType() ducktypes.Populatable {
 	return &Source{}
 }
 
 // Populate implements duck.Populatable
 func (s *Source) Populate() {
-	s.Spec.Sink = apisv1alpha1.Destination{
+	s.Spec.Sink = Destination{
 		URI: &apis.URL{
 			Scheme:   "https",
 			Host:     "tableflip.dev",

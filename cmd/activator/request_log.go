@@ -21,15 +21,24 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
-	"knative.dev/serving/pkg/activator"
+	"knative.dev/pkg/metrics"
+	"knative.dev/serving/pkg/activator/handler"
 	"knative.dev/serving/pkg/apis/serving"
-	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
 	pkghttp "knative.dev/serving/pkg/http"
 )
 
 func updateRequestLogFromConfigMap(logger *zap.SugaredLogger, h *pkghttp.RequestLogHandler) func(configMap *corev1.ConfigMap) {
 	return func(configMap *corev1.ConfigMap) {
-		newTemplate := configMap.Data["logging.request-log-template"]
+		obsconfig, err := metrics.NewObservabilityConfigFromConfigMap(configMap)
+		if err != nil {
+			logger.Errorw("Failed to get observability configmap.", zap.Error(err), "configmap", configMap)
+			return
+		}
+
+		var newTemplate string
+		if obsconfig.EnableRequestLog {
+			newTemplate = obsconfig.RequestLogTemplate
+		}
 		if err := h.SetTemplate(newTemplate); err != nil {
 			logger.Errorw("Failed to update the request log template.", zap.Error(err), "template", newTemplate)
 		} else {
@@ -38,25 +47,25 @@ func updateRequestLogFromConfigMap(logger *zap.SugaredLogger, h *pkghttp.Request
 	}
 }
 
-func requestLogTemplateInputGetter(revisionLister servinglisters.RevisionLister) pkghttp.RequestLogTemplateInputGetter {
-	return func(req *http.Request, resp *pkghttp.RequestLogResponse) *pkghttp.RequestLogTemplateInput {
-		namespace := pkghttp.LastHeaderValue(req.Header, activator.RevisionHeaderNamespace)
-		name := pkghttp.LastHeaderValue(req.Header, activator.RevisionHeaderName)
-		revInfo := &pkghttp.RequestLogRevision{
-			Namespace: namespace,
-			Name:      name,
-		}
+// requestLogTemplateInputGetter gets the template input from the request.
+// It assumes the Revision has been set on the context such that
+// handler.FromRevision() returns a non-nil revision.
+func requestLogTemplateInputGetter(req *http.Request, resp *pkghttp.RequestLogResponse) *pkghttp.RequestLogTemplateInput {
+	revision := handler.RevisionFrom(req.Context())
 
-		revision, err := revisionLister.Revisions(namespace).Get(name)
-		if err == nil && revision.Labels != nil {
-			revInfo.Configuration = revision.Labels[serving.ConfigurationLabelKey]
-			revInfo.Service = revision.Labels[serving.ServiceLabelKey]
-		}
+	revInfo := &pkghttp.RequestLogRevision{
+		Namespace: revision.Namespace,
+		Name:      revision.Name,
+	}
 
-		return &pkghttp.RequestLogTemplateInput{
-			Request:  req,
-			Response: resp,
-			Revision: revInfo,
-		}
+	if revision.Labels != nil {
+		revInfo.Configuration = revision.Labels[serving.ConfigurationLabelKey]
+		revInfo.Service = revision.Labels[serving.ServiceLabelKey]
+	}
+
+	return &pkghttp.RequestLogTemplateInput{
+		Request:  req,
+		Response: resp,
+		Revision: revInfo,
 	}
 }

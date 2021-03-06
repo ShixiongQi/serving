@@ -18,8 +18,6 @@ package serving
 
 import (
 	"context"
-	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -27,17 +25,21 @@ import (
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	network "knative.dev/networking/pkg"
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/ptr"
+	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/config"
-	routeconfig "knative.dev/serving/pkg/reconciler/route/config"
+	"knative.dev/serving/pkg/autoscaler/config/autoscalerconfig"
 )
 
 func TestValidateObjectMetadata(t *testing.T) {
 	cases := []struct {
-		name       string
-		objectMeta metav1.Object
-		expectErr  error
+		name             string
+		objectMeta       metav1.Object
+		allowAutoscaling bool
+		ctx              context.Context
+		expectErr        *apis.FieldError
 	}{{
 		name: "invalid name - dots",
 		objectMeta: &metav1.ObjectMeta{
@@ -70,13 +72,11 @@ func TestValidateObjectMetadata(t *testing.T) {
 		objectMeta: &metav1.ObjectMeta{
 			GenerateName: "some-name",
 		},
-		expectErr: (*apis.FieldError)(nil),
 	}, {
 		name: "valid generateName - trailing dash",
 		objectMeta: &metav1.ObjectMeta{
 			GenerateName: "some-name-",
 		},
-		expectErr: (*apis.FieldError)(nil),
 	}, {
 		name: "invalid generateName - dots",
 		objectMeta: &metav1.ObjectMeta{
@@ -103,15 +103,6 @@ func TestValidateObjectMetadata(t *testing.T) {
 			Paths:   []string{"name"},
 		},
 	}, {
-		name: "valid forceUpgrade annotation label",
-		objectMeta: &metav1.ObjectMeta{
-			GenerateName: "some-name",
-			Annotations: map[string]string{
-				"serving.knative.dev/forceUpgrade": "true",
-			},
-		},
-		expectErr: (*apis.FieldError)(nil),
-	}, {
 		name: "valid creator annotation label",
 		objectMeta: &metav1.ObjectMeta{
 			GenerateName: "some-name",
@@ -119,8 +110,6 @@ func TestValidateObjectMetadata(t *testing.T) {
 				CreatorAnnotation: "svc-creator",
 			},
 		},
-
-		expectErr: (*apis.FieldError)(nil),
 	}, {
 		name: "valid lastModifier annotation label",
 		objectMeta: &metav1.ObjectMeta{
@@ -129,7 +118,6 @@ func TestValidateObjectMetadata(t *testing.T) {
 				UpdaterAnnotation: "svc-modifier",
 			},
 		},
-		expectErr: (*apis.FieldError)(nil),
 	}, {
 		name: "valid lastPinned annotation label",
 		objectMeta: &metav1.ObjectMeta{
@@ -138,20 +126,22 @@ func TestValidateObjectMetadata(t *testing.T) {
 				RevisionLastPinnedAnnotationKey: "pinned-val",
 			},
 		},
-		expectErr: (*apis.FieldError)(nil),
 	}, {
-		name: "invalid knative prefix annotation",
+		name: "valid preserve annotation label",
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				RevisionLastPinnedAnnotationKey: "true",
+			},
+		},
+	}, {
+		name: "valid knative prefix annotation",
 		objectMeta: &metav1.ObjectMeta{
 			GenerateName: "some-name",
 			Annotations: map[string]string{
 				"serving.knative.dev/testAnnotation": "value",
 			},
 		},
-		expectErr: (&apis.FieldError{Message: "", Paths: []string(nil), Details: ""}).Also(
-			(&apis.FieldError{Message: "", Paths: []string(nil), Details: ""}).Also(
-				(&apis.FieldError{Message: "", Paths: []string(nil), Details: ""}).Also(
-					apis.ErrInvalidKeyName("serving.knative.dev/testAnnotation", "annotations"),
-				))),
 	}, {
 		name: "valid non-knative prefix annotation label",
 		objectMeta: &metav1.ObjectMeta{
@@ -160,96 +150,114 @@ func TestValidateObjectMetadata(t *testing.T) {
 				"testAnnotation": "testValue",
 			},
 		},
-		expectErr: (*apis.FieldError)(nil),
+	}, {
+		name:             "revision initial scale not parseable",
+		ctx:              config.ToContext(context.Background(), &config.Config{Autoscaler: &autoscalerconfig.Config{AllowZeroInitialScale: true}}),
+		allowAutoscaling: true,
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				autoscaling.InitialScaleAnnotationKey: "invalid",
+			},
+		},
+		expectErr: apis.ErrInvalidValue("invalid", "annotations."+autoscaling.InitialScaleAnnotationKey),
+	}, {
+		name:             "negative revision initial scale",
+		ctx:              config.ToContext(context.Background(), &config.Config{Autoscaler: &autoscalerconfig.Config{AllowZeroInitialScale: true}}),
+		allowAutoscaling: true,
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				autoscaling.InitialScaleAnnotationKey: "-2",
+			},
+		},
+		expectErr: apis.ErrInvalidValue("-2", "annotations."+autoscaling.InitialScaleAnnotationKey),
+	}, {
+		name:             "cluster allows zero revision initial scale",
+		ctx:              config.ToContext(context.Background(), &config.Config{Autoscaler: &autoscalerconfig.Config{AllowZeroInitialScale: true}}),
+		allowAutoscaling: true,
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				autoscaling.InitialScaleAnnotationKey: "0",
+			},
+		},
+	}, {
+		name:             "cluster does not allow zero revision initial scale",
+		allowAutoscaling: true,
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				autoscaling.InitialScaleAnnotationKey: "0",
+			},
+		},
+		expectErr: apis.ErrInvalidValue("0", "annotations."+autoscaling.InitialScaleAnnotationKey),
+	}, {
+		name:             "autoscaling annotations on a resource that doesn't allow them",
+		allowAutoscaling: false,
+		objectMeta: &metav1.ObjectMeta{
+			GenerateName: "some-name",
+			Annotations: map[string]string{
+				autoscaling.InitialScaleAnnotationKey: "0",
+			},
+		},
+		expectErr: apis.ErrInvalidKeyName(autoscaling.InitialScaleAnnotationKey, "annotations", `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`),
 	}}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := ValidateObjectMetadata(c.objectMeta)
-
-			if !reflect.DeepEqual(c.expectErr, err) {
-				t.Errorf("Expected: '%#v', Got: '%#v'", c.expectErr, err)
+			if c.ctx == nil {
+				c.ctx = config.ToContext(context.Background(), &config.Config{Autoscaler: &autoscalerconfig.Config{AllowZeroInitialScale: false}})
+			}
+			err := ValidateObjectMetadata(c.ctx, c.objectMeta, c.allowAutoscaling)
+			if got, want := err.Error(), c.expectErr.Error(); got != want {
+				t.Errorf("\nGot:  %q\nwant: %q", got, want)
 			}
 		})
 	}
 }
 
-func TestValidateQueueSidecarAnnotation(t *testing.T) {
+func TestValidateHasNoAutoscalingAnnotation(t *testing.T) {
 	cases := []struct {
 		name       string
 		annotation map[string]string
-		expectErr  error
+		expectErr  *apis.FieldError
 	}{{
-		name: "Queue sidecar resource percentage annotation more than 100",
-		annotation: map[string]string{
-			QueueSideCarResourcePercentageAnnotation: "200",
-		},
-		expectErr: &apis.FieldError{
-			Message: "expected 0.1 <= 200 <= 100",
-			Paths:   []string{QueueSideCarResourcePercentageAnnotation},
-		},
+		name:       "nil",
+		annotation: nil,
 	}, {
-		name: "Invalid queue sidecar resource percentage annotation",
-		annotation: map[string]string{
-			QueueSideCarResourcePercentageAnnotation: "",
-		},
-		expectErr: &apis.FieldError{
-			Message: "invalid value: ",
-			Paths:   []string{fmt.Sprintf("[%s]", QueueSideCarResourcePercentageAnnotation)},
-		},
-	}, {
-		name:       "empty annotation",
+		name:       "empty",
 		annotation: map[string]string{},
-		expectErr:  (*apis.FieldError)(nil),
 	}, {
-		name: "different annotation other than QueueSideCarResourcePercentageAnnotation",
-		annotation: map[string]string{
-			CreatorAnnotation: "",
-		},
-		expectErr: (*apis.FieldError)(nil),
+		name:       "no offender",
+		annotation: map[string]string{"foo": "bar"},
 	}, {
-		name: "valid value for Queue sidecar resource percentage annotation",
+		name:       "only offender",
+		annotation: map[string]string{"autoscaling.knative.dev/foo": "bar"},
+		expectErr:  apis.ErrInvalidKeyName("autoscaling.knative.dev/foo", apis.CurrentField, `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`),
+	}, {
+		name: "offender and non-offender",
 		annotation: map[string]string{
-			QueueSideCarResourcePercentageAnnotation: "100",
+			"autoscaling.knative.dev/foo": "bar",
+			"foo":                         "bar",
 		},
-		expectErr: (*apis.FieldError)(nil),
+		expectErr: apis.ErrInvalidKeyName("autoscaling.knative.dev/foo", apis.CurrentField, `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`),
 	}}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := ValidateQueueSidecarAnnotation(c.annotation)
-			if !reflect.DeepEqual(c.expectErr, err) {
-				t.Errorf("Expected: '%#v', Got: '%#v'", c.expectErr, err)
+			err := ValidateHasNoAutoscalingAnnotation(c.annotation)
+			if got, want := err.Error(), c.expectErr.Error(); got != want {
+				t.Errorf("\nGot:  %q\nwant: %q", got, want)
 			}
 		})
 	}
 }
 
-func TestValidateTimeoutSecond(t *testing.T) {
-	cases := []struct {
-		name      string
-		timeout   *int64
-		expectErr error
-	}{{
-		name:    "exceed max timeout",
-		timeout: ptr.Int64(6000),
-		expectErr: apis.ErrOutOfBoundsValue(
-			6000, 0, config.DefaultMaxRevisionTimeoutSeconds,
-			"timeoutSeconds"),
-	}, {
-		name:      "valid timeout value",
-		timeout:   ptr.Int64(100),
-		expectErr: (*apis.FieldError)(nil),
-	}}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			ctx := context.Background()
-			err := ValidateTimeoutSeconds(ctx, *c.timeout)
-			if !reflect.DeepEqual(c.expectErr, err) {
-				t.Errorf("Expected: '%#v', Got: '%#v'", c.expectErr, err)
-			}
-		})
+func cfg(m map[string]string) *config.Config {
+	d, _ := config.NewDefaultsConfigFromMap(m)
+	return &config.Config{
+		Defaults: d,
 	}
 }
 
@@ -257,26 +265,53 @@ func TestValidateContainerConcurrency(t *testing.T) {
 	cases := []struct {
 		name                 string
 		containerConcurrency *int64
-		expectErr            error
+		ctx                  context.Context
+		expectErr            *apis.FieldError
 	}{{
 		name:                 "empty containerConcurrency",
 		containerConcurrency: nil,
-		expectErr:            (*apis.FieldError)(nil),
 	}, {
 		name:                 "invalid containerConcurrency value",
 		containerConcurrency: ptr.Int64(2000),
 		expectErr: apis.ErrOutOfBoundsValue(
 			2000, 0, config.DefaultMaxRevisionContainerConcurrency, apis.CurrentField),
 	}, {
+		name:                 "invalid containerConcurrency value, non def config",
+		containerConcurrency: ptr.Int64(2000),
+		ctx: config.ToContext(context.Background(), cfg(map[string]string{
+			"container-concurrency-max-limit": "1950",
+		})),
+		expectErr: apis.ErrOutOfBoundsValue(
+			2000, 0, 1950, apis.CurrentField),
+	}, {
+		name:                 "invalid containerConcurrency value, zero but allow-container-concurrency-zero is false",
+		containerConcurrency: ptr.Int64(0),
+		ctx: config.ToContext(context.Background(), cfg(map[string]string{
+			"allow-container-concurrency-zero": "false",
+		})),
+		expectErr: apis.ErrOutOfBoundsValue(
+			0, 1, config.DefaultMaxRevisionContainerConcurrency, apis.CurrentField),
+	}, {
 		name:                 "valid containerConcurrency value",
 		containerConcurrency: ptr.Int64(10),
-		expectErr:            (*apis.FieldError)(nil),
+	}, {
+		name:                 "valid containerConcurrency value zero",
+		containerConcurrency: ptr.Int64(0),
+	}, {
+		name:                 "valid containerConcurrency value huge",
+		containerConcurrency: ptr.Int64(2019),
+		ctx: config.ToContext(context.Background(), cfg(map[string]string{
+			"container-concurrency-max-limit": "2021",
+		})),
 	}}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			err := ValidateContainerConcurrency(c.containerConcurrency)
-			if !reflect.DeepEqual(c.expectErr, err) {
-				t.Errorf("Expected: '%#v', Got: '%#v'", c.expectErr, err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.ctx == nil {
+				tc.ctx = context.Background()
+			}
+			err := ValidateContainerConcurrency(tc.ctx, tc.containerConcurrency)
+			if got, want := err.Error(), tc.expectErr.Error(); got != want {
+				t.Errorf("\nGot:  %q\nwant: %q", got, want)
 			}
 		})
 	}
@@ -286,33 +321,32 @@ func TestValidateClusterVisibilityLabel(t *testing.T) {
 	tests := []struct {
 		name      string
 		label     string
-		expectErr error
+		expectErr *apis.FieldError
 	}{{
 		name:      "empty label",
 		label:     "",
-		expectErr: apis.ErrInvalidValue("", routeconfig.VisibilityLabelKey),
+		expectErr: apis.ErrInvalidValue("", network.VisibilityLabelKey),
 	}, {
-		name:      "valid label",
-		label:     routeconfig.VisibilityClusterLocal,
-		expectErr: (*apis.FieldError)(nil),
+		name:  "valid label",
+		label: VisibilityClusterLocal,
 	}, {
 		name:      "invalid label",
 		label:     "not-cluster-local",
-		expectErr: apis.ErrInvalidValue("not-cluster-local", routeconfig.VisibilityLabelKey),
+		expectErr: apis.ErrInvalidValue("not-cluster-local", network.VisibilityLabelKey),
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := ValidateClusterVisibilityLabel(test.label)
-			if !reflect.DeepEqual(test.expectErr, err) {
-				t.Errorf("ValidateClusterVisibilityLabel(%s) = %#v, Want: '%#v'", test.label, err, test.expectErr)
+			err := validateClusterVisibilityLabel(test.label, network.VisibilityLabelKey)
+			if got, want := err.Error(), test.expectErr.Error(); got != want {
+				t.Errorf("\nGot:  %q\nwant: %q", got, want)
 			}
 		})
 	}
 
 }
 
-type WithPod struct {
+type withPod struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 	Spec              corev1.PodSpec `json:"spec,omitempty"`
@@ -334,12 +368,12 @@ func TestAnnotationCreate(t *testing.T) {
 	tests := []struct {
 		name string
 		user string
-		this *WithPod
+		this *withPod
 		want map[string]string
 	}{{
 		name: "create annotation",
 		user: u1,
-		this: &WithPod{
+		this: &withPod{
 			Spec: getSpec("foo"),
 		},
 		want: map[string]string{
@@ -349,7 +383,7 @@ func TestAnnotationCreate(t *testing.T) {
 	}, {
 		name: "create annotation should override user provided annotations",
 		user: u1,
-		this: &WithPod{
+		this: &withPod{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: map[string]string{
 					CreatorAnnotation: u2,
@@ -369,8 +403,9 @@ func TestAnnotationCreate(t *testing.T) {
 				Username: test.user,
 			})
 			SetUserInfo(ctx, nil, test.this.Spec, test.this)
-			if !reflect.DeepEqual(test.this.Annotations, test.want) {
-				t.Errorf("Annotations = %v, want: %v, diff (-got, +want): %s", test.this.Annotations, test.want, cmp.Diff(test.this.Annotations, test.want))
+			if !cmp.Equal(test.this.Annotations, test.want) {
+				t.Errorf("Annotations = %v, want: %v, diff (-want, +got):\n%s", test.this.Annotations, test.want,
+					cmp.Diff(test.want, test.this.Annotations))
 			}
 		})
 	}
@@ -384,13 +419,13 @@ func TestAnnotationUpdate(t *testing.T) {
 	tests := []struct {
 		name string
 		user string
-		prev *WithPod
-		this *WithPod
+		prev *withPod
+		this *withPod
 		want map[string]string
 	}{{
 		name: "update annotation without spec changes",
 		user: u2,
-		this: &WithPod{
+		this: &withPod{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: map[string]string{
 					CreatorAnnotation: u1,
@@ -399,7 +434,7 @@ func TestAnnotationUpdate(t *testing.T) {
 			},
 			Spec: getSpec("foo"),
 		},
-		prev: &WithPod{
+		prev: &withPod{
 			Spec: getSpec("foo"),
 		},
 		want: map[string]string{
@@ -409,7 +444,7 @@ func TestAnnotationUpdate(t *testing.T) {
 	}, {
 		name: "update annotation with spec changes",
 		user: u2,
-		this: &WithPod{
+		this: &withPod{
 			ObjectMeta: metav1.ObjectMeta{
 				Annotations: map[string]string{
 					CreatorAnnotation: u1,
@@ -418,7 +453,7 @@ func TestAnnotationUpdate(t *testing.T) {
 			},
 			Spec: getSpec("bar"),
 		},
-		prev: &WithPod{
+		prev: &withPod{
 			Spec: getSpec("foo"),
 		},
 		want: map[string]string{
@@ -435,8 +470,52 @@ func TestAnnotationUpdate(t *testing.T) {
 				ctx = apis.WithinUpdate(ctx, test.prev)
 			}
 			SetUserInfo(ctx, test.prev.Spec, test.this.Spec, test.this)
-			if !reflect.DeepEqual(test.this.Annotations, test.want) {
-				t.Errorf("Annotations = %v, want: %v, diff (-got, +want): %s", test.this.Annotations, test.want, cmp.Diff(test.this.Annotations, test.want))
+			if !cmp.Equal(test.this.Annotations, test.want) {
+				t.Errorf("Annotations = %v, want: %v, diff (-want, +got):\n%s", test.this.Annotations, test.want,
+					cmp.Diff(test.want, test.this.Annotations))
+			}
+		})
+	}
+}
+
+func TestValidateRolloutDurationAnnotation(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{{
+		name: "empty",
+	}, {
+		name:  "valid",
+		value: "120s",
+	}, {
+		name:  "fancy valid",
+		value: "3h15m21s",
+	}, {
+		name:  "in ns",
+		value: "120000000000",
+		want:  "invalid value: 120000000000: serving.knative.dev/rolloutDuration",
+	}, {
+		name:  "not a valid duration",
+		value: "five minutes and 6 seconds",
+		want:  "invalid value: five minutes and 6 seconds: serving.knative.dev/rolloutDuration",
+	}, {
+		name:  "negative",
+		value: "-211s",
+		want:  "rolloutDuration=-211s must be positive: serving.knative.dev/rolloutDuration",
+	}, {
+		name:  "too precise",
+		value: "211s44ms",
+		want:  "rolloutDuration=211s44ms is not at second precision: serving.knative.dev/rolloutDuration",
+	}}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateRolloutDurationAnnotation(map[string]string{
+				RolloutDurationKey: tc.value,
+			})
+			if got, want := err.Error(), tc.want; got != want {
+				t.Errorf("APIErr mismatch, diff(-want,+got):\n%s", cmp.Diff(want, got))
 			}
 		})
 	}

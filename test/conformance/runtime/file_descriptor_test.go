@@ -24,14 +24,14 @@ import (
 	"knative.dev/serving/test"
 )
 
-// TestMustHaveCgroupConfigured verifies using the runtime test container that reading from the
+// TestShouldHaveStdinEOF verifies using the runtime test container that reading from the
 // stdin file descriptor results in EOF.
 func TestShouldHaveStdinEOF(t *testing.T) {
 	clients := test.Setup(t)
 
 	_, ri, err := fetchRuntimeInfo(t, clients)
 	if err != nil {
-		t.Fatalf("Error fetching runtime info: %v", err)
+		t.Fatal("Error fetching runtime info:", err)
 	}
 
 	if ri.Host == nil {
@@ -43,7 +43,7 @@ func TestShouldHaveStdinEOF(t *testing.T) {
 	}
 
 	if stdin.Error != "" {
-		t.Fatalf("Error reading stdin: %v", stdin.Error)
+		t.Fatal("Error reading stdin:", stdin.Error)
 	}
 
 	if got, want := *stdin.EOF, true; got != want {

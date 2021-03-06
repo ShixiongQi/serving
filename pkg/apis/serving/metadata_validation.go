@@ -18,94 +18,101 @@ package serving
 
 import (
 	"context"
-	"strconv"
+	"fmt"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"knative.dev/pkg/apis"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/config"
-	routeconfig "knative.dev/serving/pkg/reconciler/route/config"
 )
 
-var (
-	allowedAnnotations = map[string]struct{}{
-		UpdaterAnnotation:                {},
-		CreatorAnnotation:                {},
-		RevisionLastPinnedAnnotationKey:  {},
-		GroupNamePrefix + "forceUpgrade": {},
-	}
-)
-
-// ValidateObjectMetadata validates that `metadata` stanza of the
+// ValidateObjectMetadata validates that the `metadata` stanza of the
 // resources is correct.
-func ValidateObjectMetadata(meta metav1.Object) *apis.FieldError {
-	return apis.ValidateObjectMetadata(meta).
-		Also(autoscaling.ValidateAnnotations(meta.GetAnnotations()).
-			Also(validateKnativeAnnotations(meta.GetAnnotations())).
-			ViaField("annotations"))
+// If `allowAutoscalingAnnotations` is true autoscaling annotations, if
+// present, are validated. If `allowAutoscalingAnnotations` is false
+// autoscaling annotations are validated not to be present.
+func ValidateObjectMetadata(ctx context.Context, meta metav1.Object, allowAutoscalingAnnotations bool) *apis.FieldError {
+	errs := apis.ValidateObjectMetadata(meta)
+
+	if allowAutoscalingAnnotations {
+		errs = errs.Also(autoscaling.ValidateAnnotations(ctx, config.FromContextOrDefaults(ctx).Autoscaler, meta.GetAnnotations()).ViaField("annotations"))
+	} else {
+		errs = errs.Also(ValidateHasNoAutoscalingAnnotation(meta.GetAnnotations()).ViaField("annotations"))
+	}
+
+	return errs
 }
 
-func validateKnativeAnnotations(annotations map[string]string) (errs *apis.FieldError) {
+// ValidateRolloutDurationAnnotation validates the rollout duration annotation.
+// This annotation can be set on either service or route objects.
+func ValidateRolloutDurationAnnotation(annos map[string]string) (errs *apis.FieldError) {
+	if v := annos[RolloutDurationKey]; v != "" {
+		// Parse as duration.
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return errs.Also(apis.ErrInvalidValue(v, RolloutDurationKey))
+		}
+		// Validate that it has second precision.
+		if d.Round(time.Second) != d {
+			return errs.Also(&apis.FieldError{
+				// Even if tempting %v won't work here, since it might output the value spelled differently.
+				Message: fmt.Sprintf("rolloutDuration=%s is not at second precision", v),
+				Paths:   []string{RolloutDurationKey},
+			})
+		}
+		// And positive.
+		if d < 0 {
+			return errs.Also(&apis.FieldError{
+				Message: fmt.Sprintf("rolloutDuration=%s must be positive", v),
+				Paths:   []string{RolloutDurationKey},
+			})
+		}
+	}
+	return errs
+}
+
+// ValidateHasNoAutoscalingAnnotation validates that the respective entity does not have
+// annotations from the autoscaling group. It's to be used to validate Service and
+// Configuration.
+func ValidateHasNoAutoscalingAnnotation(annotations map[string]string) (errs *apis.FieldError) {
 	for key := range annotations {
-		if _, ok := allowedAnnotations[key]; !ok && strings.HasPrefix(key, GroupNamePrefix) {
-			errs = errs.Also(apis.ErrInvalidKeyName(key, apis.CurrentField))
+		if strings.HasPrefix(key, autoscaling.GroupName) {
+			errs = errs.Also(
+				apis.ErrInvalidKeyName(key, apis.CurrentField, `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`))
 		}
 	}
-	return
-}
-
-// ValidateQueueSidecarAnnotation validates QueueSideCarResourcePercentageAnnotation
-func ValidateQueueSidecarAnnotation(annotations map[string]string) *apis.FieldError {
-	if len(annotations) == 0 {
-		return nil
-	}
-	v, ok := annotations[QueueSideCarResourcePercentageAnnotation]
-	if !ok {
-		return nil
-	}
-	value, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return apis.ErrInvalidValue(v, apis.CurrentField).ViaKey(QueueSideCarResourcePercentageAnnotation)
-	}
-	if value <= 0.1 || value > 100 {
-		return apis.ErrOutOfBoundsValue(value, 0.1, 100.0, QueueSideCarResourcePercentageAnnotation)
-	}
-	return nil
-}
-
-// ValidateTimeoutSeconds validates timeout by comparing MaxRevisionTimeoutSeconds
-func ValidateTimeoutSeconds(ctx context.Context, timeoutSeconds int64) *apis.FieldError {
-	if timeoutSeconds != 0 {
-		cfg := config.FromContextOrDefaults(ctx)
-		if timeoutSeconds > cfg.Defaults.MaxRevisionTimeoutSeconds || timeoutSeconds < 0 {
-			return apis.ErrOutOfBoundsValue(timeoutSeconds, 0,
-				cfg.Defaults.MaxRevisionTimeoutSeconds,
-				"timeoutSeconds")
-		}
-	}
-	return nil
+	return errs
 }
 
 // ValidateContainerConcurrency function validates the ContainerConcurrency field
 // TODO(#5007): Move this to autoscaling.
-func ValidateContainerConcurrency(containerConcurrency *int64) *apis.FieldError {
+func ValidateContainerConcurrency(ctx context.Context, containerConcurrency *int64) *apis.FieldError {
 	if containerConcurrency != nil {
-		if *containerConcurrency < 0 || *containerConcurrency > config.DefaultMaxRevisionContainerConcurrency {
+		cfg := config.FromContextOrDefaults(ctx).Defaults
+
+		var minContainerConcurrency int64
+		if !cfg.AllowContainerConcurrencyZero {
+			minContainerConcurrency = 1
+		}
+
+		if *containerConcurrency < minContainerConcurrency || *containerConcurrency > cfg.ContainerConcurrencyMaxLimit {
 			return apis.ErrOutOfBoundsValue(
-				*containerConcurrency, 0, config.DefaultMaxRevisionContainerConcurrency, apis.CurrentField)
+				*containerConcurrency, minContainerConcurrency, cfg.ContainerConcurrencyMaxLimit, apis.CurrentField)
 		}
 	}
 	return nil
 }
 
-// ValidateClusterVisibilityLabel function validates the visibility label on a Route
-func ValidateClusterVisibilityLabel(label string) (errs *apis.FieldError) {
-	if label != routeconfig.VisibilityClusterLocal {
-		errs = apis.ErrInvalidValue(label, routeconfig.VisibilityLabelKey)
+// validateClusterVisibilityLabel function validates the visibility label on a Route
+func validateClusterVisibilityLabel(label, key string) (errs *apis.FieldError) {
+	if label != VisibilityClusterLocal {
+		errs = apis.ErrInvalidValue(label, key)
 	}
-	return
+	return errs
 }
 
 // SetUserInfo sets creator and updater annotations

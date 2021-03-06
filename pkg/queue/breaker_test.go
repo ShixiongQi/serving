@@ -18,6 +18,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -37,30 +38,78 @@ func TestBreakerInvalidConstructor(t *testing.T) {
 		name    string
 		options BreakerParams
 	}{{
-		"QueueDepth = 0",
-		BreakerParams{QueueDepth: 0, MaxConcurrency: 1, InitialCapacity: 1},
+		name:    "QueueDepth = 0",
+		options: BreakerParams{QueueDepth: 0, MaxConcurrency: 1, InitialCapacity: 1},
 	}, {
-		"MaxConcurrency negative",
-		BreakerParams{QueueDepth: 1, MaxConcurrency: -1, InitialCapacity: 1},
+		name:    "MaxConcurrency negative",
+		options: BreakerParams{QueueDepth: 1, MaxConcurrency: -1, InitialCapacity: 1},
 	}, {
-		"InitialCapacity negative",
-		BreakerParams{QueueDepth: 1, MaxConcurrency: 1, InitialCapacity: -1},
+		name:    "InitialCapacity negative",
+		options: BreakerParams{QueueDepth: 1, MaxConcurrency: 1, InitialCapacity: -1},
 	}, {
-		"InitialCapacity out-of-bounds",
-		BreakerParams{QueueDepth: 1, MaxConcurrency: 5, InitialCapacity: 6},
+		name:    "InitialCapacity out-of-bounds",
+		options: BreakerParams{QueueDepth: 1, MaxConcurrency: 5, InitialCapacity: 6},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			defer func() {
 				if r := recover(); r == nil {
-					t.Errorf("Expected a panic but the code didn't panic.")
+					t.Error("Expected a panic but the code didn't panic.")
 				}
 			}()
 
 			NewBreaker(test.options)
 		})
 	}
+}
+
+func TestBreakerReserveOverload(t *testing.T) {
+	params := BreakerParams{QueueDepth: 1, MaxConcurrency: 1, InitialCapacity: 1}
+	b := NewBreaker(params) // Breaker capacity = 2
+	cb1, rr := b.Reserve(context.Background())
+	if !rr {
+		t.Fatal("Reserve1 failed")
+	}
+	_, rr = b.Reserve(context.Background())
+	if rr {
+		t.Fatal("Reserve2 was an unexpected success.")
+	}
+	// Release a slot.
+	cb1()
+	// And reserve it again.
+	cb2, rr := b.Reserve(context.Background())
+	if !rr {
+		t.Fatal("Reserve2 failed")
+	}
+	cb2()
+}
+
+func TestBreakerOverloadMixed(t *testing.T) {
+	// This tests when reservation and maybe are intermised.
+	params := BreakerParams{QueueDepth: 1, MaxConcurrency: 1, InitialCapacity: 1}
+	b := NewBreaker(params) // Breaker capacity = 2
+	reqs := newRequestor(b)
+
+	// Bring breaker to capacity.
+	reqs.request()
+	// This happens in go-routine, so spin.
+	for _, in := unpack(b.sem.state.Load()); in != 1; _, in = unpack(b.sem.state.Load()) {
+		time.Sleep(time.Millisecond * 2)
+	}
+	_, rr := b.Reserve(context.Background())
+	if rr {
+		t.Fatal("Reserve was an unexpected success.")
+	}
+	// Open a slot.
+	reqs.processSuccessfully(t)
+	// Now reservation should work.
+	cb, rr := b.Reserve(context.Background())
+	if !rr {
+		t.Fatal("Reserve unexpectedly failed")
+	}
+	// Process the reservation.
+	cb()
 }
 
 func TestBreakerOverload(t *testing.T) {
@@ -172,17 +221,6 @@ func TestBreakerUpdateConcurrency(t *testing.T) {
 		t.Errorf("Capacity() = %d, want: %d", got, want)
 	}
 
-	if err := b.UpdateConcurrency(-2); err != ErrUpdateCapacity {
-		t.Errorf("UpdateConcurrency = %v, want: %v", err, ErrUpdateCapacity)
-	}
-}
-
-func TestBreakerUpdateConcurrencyOverlow(t *testing.T) {
-	params := BreakerParams{QueueDepth: 1, MaxConcurrency: 1, InitialCapacity: 0}
-	b := NewBreaker(params)
-	if err := b.UpdateConcurrency(2); err != ErrUpdateCapacity {
-		t.Errorf("UpdateConcurrency = %v, want: %v", err, ErrUpdateCapacity)
-	}
 }
 
 // Test empty semaphore, token cannot be acquired
@@ -200,6 +238,13 @@ func TestSemaphoreAcquireHasNoCapacity(t *testing.T) {
 	}
 }
 
+func TestSemaphoreAcquireNonBlockingHasNoCapacity(t *testing.T) {
+	sem := newSemaphore(1, 0)
+	if sem.tryAcquire() {
+		t.Error("Should have failed immediately")
+	}
+}
+
 // Test empty semaphore, add capacity, token can be acquired
 func TestSemaphoreAcquireHasCapacity(t *testing.T) {
 	gotChan := make(chan struct{}, 1)
@@ -207,7 +252,7 @@ func TestSemaphoreAcquireHasCapacity(t *testing.T) {
 
 	sem := newSemaphore(1, 0)
 	tryAcquire(sem, gotChan)
-	sem.release() // Allows 1 acquire
+	sem.updateCapacity(1) // Allows 1 acquire
 
 	for i := 0; i < want; i++ {
 		select {
@@ -226,50 +271,25 @@ func TestSemaphoreAcquireHasCapacity(t *testing.T) {
 	}
 }
 
-func TestSemaphoreHasCapacity(t *testing.T) {
-	sem := newSemaphore(1, 1)
-	if !sem.hasCapacity() {
-		t.Error("Has no capacity")
-	}
-	sem.acquire(context.Background())
-	if sem.hasCapacity() {
-		t.Error("Has capacity")
-	}
-}
-
 func TestSemaphoreRelease(t *testing.T) {
 	sem := newSemaphore(1, 1)
 	sem.acquire(context.Background())
-	if err := sem.release(); err != nil {
-		t.Errorf("release = %v; want: %v", err, nil)
-	}
-	if err := sem.release(); err != ErrRelease {
-		t.Errorf("release = %v; want: %v", err, ErrRelease)
-	}
-}
-
-func TestSemaphoreReleasesSeveralReducers(t *testing.T) {
-	const wantAfterFirstrelease = 1
-	const wantAfterSecondrelease = 0
-	sem := newSemaphore(2, 2)
-	sem.acquire(context.Background())
-	sem.acquire(context.Background())
-	sem.updateCapacity(0)
-	sem.release()
-	if got := sem.Capacity(); got != wantAfterSecondrelease {
-		t.Errorf("Capacity = %d, want: %d", got, wantAfterSecondrelease)
-	}
-	if sem.reducers != wantAfterFirstrelease {
-		t.Errorf("sem.reducers = %d, want: %d", sem.reducers, wantAfterFirstrelease)
-	}
-
-	sem.release()
-	if got := sem.Capacity(); got != wantAfterSecondrelease {
-		t.Errorf("Capacity = %d, want: %d", got, wantAfterSecondrelease)
-	}
-	if sem.reducers != wantAfterSecondrelease {
-		t.Errorf("sem.reducers = %d, want: %d", sem.reducers, wantAfterSecondrelease)
-	}
+	func() {
+		defer func() {
+			if e := recover(); e != nil {
+				t.Error("Expected no panic, got message:", e)
+			}
+			sem.release()
+		}()
+	}()
+	func() {
+		defer func() {
+			if e := recover(); e == nil {
+				t.Error("Expected panic, but got none")
+			}
+		}()
+		sem.release()
+	}()
 }
 
 func TestSemaphoreUpdateCapacity(t *testing.T) {
@@ -285,67 +305,14 @@ func TestSemaphoreUpdateCapacity(t *testing.T) {
 	}
 }
 
-// Test the case when we add more capacity then the number of waiting reducers
-func TestSemaphoreUpdateCapacityLessThenReducers(t *testing.T) {
-	const initialCapacity = 2
-	sem := newSemaphore(2, initialCapacity)
-	sem.acquire(context.Background())
-	sem.acquire(context.Background())
-	sem.updateCapacity(initialCapacity - 2)
-	if got, want := sem.reducers, 2; got != want {
-		t.Errorf("sem.reducers = %d, want: %d", got, want)
-	}
-	sem.release()
-	sem.release()
-	sem.release()
-	if got, want := sem.reducers, 0; got != want {
-		t.Errorf("sem.reducers = %d, want: %d", got, want)
-	}
-}
+func TestPackUnpack(t *testing.T) {
+	wantL := uint64(256)
+	wantR := uint64(513)
 
-func TestSemaphoreUpdateCapacityConsumingReducers(t *testing.T) {
-	const initialCapacity = 2
-	sem := newSemaphore(2, initialCapacity)
-	sem.acquire(context.Background())
-	sem.acquire(context.Background())
-	sem.updateCapacity(initialCapacity - 2)
-	if got, want := sem.reducers, 2; got != want {
-		t.Errorf("sem.reducers = %d, want: %d", got, want)
-	}
+	gotL, gotR := unpack(pack(wantL, wantR))
 
-	sem.updateCapacity(initialCapacity)
-	if got, want := sem.reducers, 0; got != want {
-		t.Errorf("sem.reducers = %d, want: %d", got, want)
-	}
-}
-
-func TestSemaphoreUpdateCapacityOverflow(t *testing.T) {
-	sem := newSemaphore(2, 0)
-	if err := sem.updateCapacity(3); err != ErrUpdateCapacity {
-		t.Errorf("updateCapacity = %v, want: %v", err, ErrUpdateCapacity)
-	}
-}
-
-func TestSemaphoreUpdateCapacityOutOfBound(t *testing.T) {
-	sem := newSemaphore(1, 1)
-	sem.acquire(context.Background())
-	if err := sem.updateCapacity(-1); err != ErrUpdateCapacity {
-		t.Errorf("updateCapacity = %v, want: %v", err, ErrUpdateCapacity)
-	}
-}
-
-func TestSemaphoreUpdateCapacityBrokenState(t *testing.T) {
-	sem := newSemaphore(1, 0)
-	sem.release() // This Release is not paired with an acquire
-	if err := sem.updateCapacity(1); err != ErrUpdateCapacity {
-		t.Errorf("updateCapacity = %v, want: %v", err, ErrUpdateCapacity)
-	}
-}
-
-func TestSemaphoreUpdateCapacityDoNothing(t *testing.T) {
-	sem := newSemaphore(1, 1)
-	if err := sem.updateCapacity(1); err != nil {
-		t.Errorf("updateCapacity = %v, want: %v", err, nil)
+	if gotL != wantL || gotR != wantR {
+		t.Fatalf("Got %d, %d want %d, %d", gotL, gotR, wantL, wantR)
 	}
 }
 
@@ -405,4 +372,53 @@ func (r *requestor) processSuccessfully(t *testing.T) {
 	if !<-r.acceptedCh {
 		t.Error("expected request to succeed but it failed")
 	}
+}
+
+func BenchmarkBreakerMaybe(b *testing.B) {
+	op := func() {}
+
+	for _, c := range []int{1, 10, 100, 1000} {
+		breaker := NewBreaker(BreakerParams{QueueDepth: 10000000, MaxConcurrency: c, InitialCapacity: c})
+
+		b.Run(fmt.Sprintf("%d-sequential", c), func(b *testing.B) {
+			for j := 0; j < b.N; j++ {
+				breaker.Maybe(context.Background(), op)
+			}
+		})
+
+		b.Run(fmt.Sprintf("%d-parallel", c), func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					breaker.Maybe(context.Background(), op)
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkBreakerReserve(b *testing.B) {
+	op := func() {}
+	breaker := NewBreaker(BreakerParams{QueueDepth: 1, MaxConcurrency: 10000000, InitialCapacity: 10000000})
+
+	b.Run("sequential", func(b *testing.B) {
+		for j := 0; j < b.N; j++ {
+			free, got := breaker.Reserve(context.Background())
+			op()
+			if got {
+				free()
+			}
+		}
+	})
+
+	b.Run("parallel", func(b *testing.B) {
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				free, got := breaker.Reserve(context.Background())
+				op()
+				if got {
+					free()
+				}
+			}
+		})
+	})
 }

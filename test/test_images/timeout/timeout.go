@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,14 +19,16 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
+	network "knative.dev/networking/pkg"
 	"knative.dev/serving/test"
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	// Sleep for a set amount of time before sending headers
+	// Sleep for a set amount of time before sending headers.
 	if initialTimeout := r.URL.Query().Get("initialTimeout"); initialTimeout != "" {
 		parsed, _ := strconv.Atoi(initialTimeout)
 		time.Sleep(time.Duration(parsed) * time.Millisecond)
@@ -40,7 +42,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	// Sleep for a set amount of time before sending response
+	// Sleep for a set amount of time before sending response.
 	timeout, _ := strconv.Atoi(r.URL.Query().Get("timeout"))
 	time.Sleep(time.Duration(timeout) * time.Millisecond)
 
@@ -48,5 +50,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	test.ListenAndServeGracefully(":8080", handler)
+	h := network.NewProbeHandler(http.HandlerFunc(handler))
+	test.ListenAndServeGracefully(":"+os.Getenv("PORT"), h.ServeHTTP)
 }

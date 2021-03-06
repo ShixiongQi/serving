@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -24,12 +25,15 @@ import (
 	fakedynamicclient "knative.dev/pkg/injection/clients/dynamicclient/fake"
 	"knative.dev/serving/pkg/apis/serving"
 
+	podscalable "knative.dev/serving/pkg/client/injection/ducks/autoscaling/v1alpha1/podscalable/fake"
+
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/tools/cache"
 
 	. "knative.dev/pkg/reconciler/testing"
 )
@@ -69,18 +73,18 @@ func TestScaleResource(t *testing.T) {
 			gvr, name, err := ScaleResourceArguments(tc.objectRef)
 
 			if !cmp.Equal(gvr, tc.wantGVR) {
-				t.Errorf("ScaleResource() = %v, want: %v, diff: %s", gvr, tc.wantGVR, cmp.Diff(gvr, tc.wantGVR))
+				t.Errorf("ScaleResourceArguments() = %v, want: %v, diff: %s", gvr, tc.wantGVR, cmp.Diff(gvr, tc.wantGVR))
 			}
 
 			if name != tc.wantName {
-				t.Errorf("ScaleResource() = %s, want %s", name, tc.wantName)
+				t.Errorf("ScaleResourceArguments() = %s, want %s", name, tc.wantName)
 			}
 
 			if err == nil && tc.wantErr {
-				t.Error("ScaleResource() didn't return an error")
+				t.Error("ScaleResourceArguments() didn't return an error")
 			}
 			if err != nil && !tc.wantErr {
-				t.Errorf("ScaleResource() = %v, want no error", err)
+				t.Errorf("ScaleResourceArguments() = %v, want no error", err)
 			}
 		})
 	}
@@ -89,27 +93,30 @@ func TestScaleResource(t *testing.T) {
 func TestGetScaleResource(t *testing.T) {
 	ctx, _ := SetupFakeContext(t)
 
-	deployment := newDeployment(t, fakedynamicclient.Get(ctx), "testdeployment", 5)
+	deployment := newDeployment(ctx, t, fakedynamicclient.Get(ctx), "testdeployment", 5)
 
-	psInformerFactory := NewPodScalableInformerFactory(ctx)
+	psInformerFactory := podscalable.Get(ctx)
 	objectRef := corev1.ObjectReference{
 		Name:       deployment.Name,
 		Kind:       "deployment",
 		APIVersion: "apps/v1",
 	}
-	scale, err := GetScaleResource(testNamespace, objectRef, psInformerFactory)
+	scale, err := GetScaleResource(testNamespace, objectRef, func(gvr schema.GroupVersionResource) (cache.GenericLister, error) {
+		_, l, err := psInformerFactory.Get(ctx, gvr)
+		return l, err
+	})
 	if err != nil {
-		t.Fatalf("GetScale got error = %v", err)
+		t.Fatal("GetScaleResource() got error =", err)
 	}
 	if got, want := scale.Status.Replicas, int32(5); got != want {
-		t.Errorf("GetScale.Status.Replicas = %d, want: %d", got, want)
+		t.Errorf("GetScaleResource().Status.Replicas = %d, want: %d", got, want)
 	}
 	if got, want := scale.Spec.Selector.MatchLabels[serving.RevisionUID], "1982"; got != want {
-		t.Errorf("GetScale.Status.Selector = %q, want = %q", got, want)
+		t.Errorf("GetScaleResource().Status.Selector = %q, want = %q", got, want)
 	}
 }
 
-func newDeployment(t *testing.T, dynamicClient dynamic.Interface, name string, replicas int) *v1.Deployment {
+func newDeployment(ctx context.Context, t *testing.T, dynamicClient dynamic.Interface, name string, replicas int) *v1.Deployment {
 	t.Helper()
 
 	uns := &unstructured.Unstructured{
@@ -139,14 +146,14 @@ func newDeployment(t *testing.T, dynamicClient dynamic.Interface, name string, r
 		Group:    "apps",
 		Version:  "v1",
 		Resource: "deployments",
-	}).Namespace(testNamespace).Create(uns, metav1.CreateOptions{})
+	}).Namespace(testNamespace).Create(ctx, uns, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("Create() = %v", err)
+		t.Fatal("Create() =", err)
 	}
 
 	deployment := &v1.Deployment{}
 	if err := duck.FromUnstructured(u, deployment); err != nil {
-		t.Fatalf("FromUnstructured() = %v", err)
+		t.Fatal("FromUnstructured() =", err)
 	}
 	return deployment
 }

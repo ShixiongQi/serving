@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    https://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,16 +17,16 @@ limitations under the License.
 package names
 
 import (
-	"fmt"
-
 	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/network"
 )
 
+// K8sService returns the name of the K8sService for a given route.
 func K8sService(route kmeta.Accessor) string {
 	return route.GetName()
 }
 
+// K8sServiceFullname returns the full name of the K8sService for a given route.
 func K8sServiceFullname(route kmeta.Accessor) string {
 	return network.GetServiceHostname(K8sService(route), route.GetNamespace())
 }
@@ -40,5 +40,5 @@ func Ingress(route kmeta.Accessor) string {
 // Certificate returns the name for the Certificate
 // child resource for the given Route.
 func Certificate(route kmeta.Accessor) string {
-	return fmt.Sprintf("route-%s", route.GetUID())
+	return "route-" + string(route.GetUID())
 }

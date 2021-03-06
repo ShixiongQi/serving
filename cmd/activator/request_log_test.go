@@ -23,18 +23,16 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-
-	testing2 "knative.dev/pkg/logging/testing"
-	rtesting "knative.dev/pkg/reconciler/testing"
-	"knative.dev/serving/pkg/activator"
-	"knative.dev/serving/pkg/apis/serving"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
-	fakerevisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision/fake"
-	servinglisters "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
-	pkghttp "knative.dev/serving/pkg/http"
-
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	ltesting "knative.dev/pkg/logging/testing"
+	"knative.dev/pkg/metrics"
+	"knative.dev/serving/pkg/activator"
+	activatorhandler "knative.dev/serving/pkg/activator/handler"
+	"knative.dev/serving/pkg/apis/serving"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	pkghttp "knative.dev/serving/pkg/http"
 )
 
 const (
@@ -50,65 +48,88 @@ func TestUpdateRequestLogFromConfigMap(t *testing.T) {
 	})
 	buf := bytes.NewBufferString("")
 	handler, err := pkghttp.NewRequestLogHandler(baseHandler, buf, "",
-		requestLogTemplateInputGetter(revisionLister(t, true)), false /*enableProbeRequestLog*/)
+		requestLogTemplateInputGetter, false /*enableProbeRequestLog*/)
 	if err != nil {
-		t.Fatalf("want: no error, got: %v", err)
+		t.Fatal("want: no error, got:", err)
 	}
 
 	tests := []struct {
-		name     string
-		url      string
-		body     string
-		template string
-		want     string
+		name string
+		url  string
+		data map[string]string
+		want string
 	}{{
-		name:     "empty template",
-		url:      "http://example.com/testpage",
-		body:     "test",
-		template: "",
-		want:     "",
+		name: "empty template",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "",
+		},
 	}, {
-		name:     "template with new line",
-		url:      "http://example.com/testpage",
-		body:     "test",
-		template: "{{.Request.URL}}\n",
-		want:     "http://example.com/testpage\n",
+		name: "template with new line",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "{{.Request.URL}}\n",
+			metrics.EnableReqLogKey:   "true",
+		},
+		want: "http://example.com/testpage\n",
 	}, {
-		name:     "invalid template",
-		url:      "http://example.com",
-		body:     "test",
-		template: "{{}}",
-		want:     "http://example.com\n",
+		name: "invalid template",
+		url:  "http://example.com",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "{{}}",
+		},
+		want: "http://example.com\n",
 	}, {
-		name:     "revision info",
-		url:      "http://example.com",
-		body:     "test",
-		template: "{{.Revision.Name}}, {{.Revision.Namespace}}, {{.Revision.Service}}, {{.Revision.Configuration}}, {{.Revision.PodName}}, {{.Revision.PodIP}}",
-		want:     "testRevision, testNs, testSvc, testConfig, , \n",
+		name: "revision info",
+		url:  "http://example.com",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "{{.Revision.Name}}, {{.Revision.Namespace}}, {{.Revision.Service}}, {{.Revision.Configuration}}, {{.Revision.PodName}}, {{.Revision.PodIP}}",
+			metrics.EnableReqLogKey:   "true",
+		},
+		want: "testRevision, testNs, testSvc, testConfig, , \n",
 	}, {
-		name:     "empty template 2",
-		url:      "http://example.com/testpage",
-		body:     "test",
-		template: "",
-		want:     "",
+		name: "empty template 2",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "",
+		},
+	}, {
+		name: "explicitly enable request logging",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "{{.Request.URL}}\n",
+			metrics.EnableReqLogKey:   "true",
+		},
+		want: "http://example.com/testpage\n",
+	}, {
+		name: "explicitly disable request logging",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "{{.Request.URL}}\n",
+			metrics.EnableReqLogKey:   "false",
+		},
+	}, {
+		name: "explicitly enable request logging with empty template",
+		url:  "http://example.com/testpage",
+		data: map[string]string{
+			metrics.ReqLogTemplateKey: "",
+			metrics.EnableReqLogKey:   "true",
+		},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			buf.Reset()
 			cm := &corev1.ConfigMap{}
-			cm.Data = map[string]string{"logging.request-log-template": test.template}
-			(updateRequestLogFromConfigMap(testing2.TestLogger(t), handler))(cm)
+			cm.Data = test.data
+			(updateRequestLogFromConfigMap(ltesting.TestLogger(t), handler))(cm)
 			resp := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, test.url, bytes.NewBufferString(test.body))
-			req.Header = map[string][]string{
-				activator.RevisionHeaderName:      {testRevisionName},
-				activator.RevisionHeaderNamespace: {testNamespaceName},
-			}
-			handler.ServeHTTP(resp, req)
+			rs := string(uuid.NewUUID())
+			req := httptest.NewRequest(http.MethodPost, test.url, bytes.NewBufferString(rs))
+			ctx := activatorhandler.WithRevision(req.Context(), revision(true))
+			handler.ServeHTTP(resp, req.WithContext(ctx))
 
-			got := buf.String()
-			if got != test.want {
+			if got := buf.String(); got != test.want {
 				t.Errorf("got '%v', want '%v'", got, test.want)
 			}
 		})
@@ -118,13 +139,13 @@ func TestUpdateRequestLogFromConfigMap(t *testing.T) {
 func TestRequestLogTemplateInputGetter(t *testing.T) {
 	tests := []struct {
 		name     string
-		getter   pkghttp.RequestLogTemplateInputGetter
+		revision *v1.Revision
 		request  *http.Request
 		response *pkghttp.RequestLogResponse
 		want     pkghttp.RequestLogRevision
 	}{{
-		name:   "success",
-		getter: requestLogTemplateInputGetter(revisionLister(t, true)),
+		name:     "success",
+		revision: revision(true),
 		request: &http.Request{Header: map[string][]string{
 			activator.RevisionHeaderName:      {testRevisionName},
 			activator.RevisionHeaderNamespace: {testNamespaceName},
@@ -137,20 +158,8 @@ func TestRequestLogTemplateInputGetter(t *testing.T) {
 			Service:       testServiceName,
 		},
 	}, {
-		name:   "revision not found",
-		getter: requestLogTemplateInputGetter(revisionLister(t, true)),
-		request: &http.Request{Header: map[string][]string{
-			activator.RevisionHeaderName:      {"foo"},
-			activator.RevisionHeaderNamespace: {"bar"},
-		}},
-		response: &pkghttp.RequestLogResponse{Code: http.StatusAlreadyReported},
-		want: pkghttp.RequestLogRevision{
-			Name:      "foo",
-			Namespace: "bar",
-		},
-	}, {
-		name:   "labels not found",
-		getter: requestLogTemplateInputGetter(revisionLister(t, false)),
+		name:     "labels not found",
+		revision: revision(false),
 		request: &http.Request{Header: map[string][]string{
 			activator.RevisionHeaderName:      {testRevisionName},
 			activator.RevisionHeaderNamespace: {testNamespaceName},
@@ -164,12 +173,15 @@ func TestRequestLogTemplateInputGetter(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.getter(test.request, test.response)
+			ctx := activatorhandler.WithRevision(test.request.Context(), test.revision)
+			request := test.request.WithContext(ctx)
+
+			got := requestLogTemplateInputGetter(request, test.response)
 			if !cmp.Equal(*got.Revision, test.want) {
-				t.Errorf("Got = %v, want: %v, diff: %s", got.Revision, test.want, cmp.Diff(got.Revision, test.want))
+				t.Errorf("Got = %v, want: %v, diff:\n%s", got.Revision, test.want, cmp.Diff(got.Revision, test.want))
 			}
-			if got.Request != test.request {
-				t.Errorf("Got = %v, want: %v", got.Request, test.request)
+			if got.Request != request {
+				t.Errorf("Got = %v, want: %v", got.Request, request)
 			}
 			if got.Response != test.response {
 				t.Errorf("Got = %v, want: %v", got.Response, test.response)
@@ -178,10 +190,14 @@ func TestRequestLogTemplateInputGetter(t *testing.T) {
 	}
 }
 
-func revisionLister(t *testing.T, addLabels bool) servinglisters.RevisionLister {
-	rev := &v1alpha1.Revision{}
-	rev.Name = testRevisionName
-	rev.Namespace = testNamespaceName
+func revision(addLabels bool) *v1.Revision {
+	rev := &v1.Revision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testRevisionName,
+			Namespace: testNamespaceName,
+		},
+	}
+
 	if addLabels {
 		rev.Labels = map[string]string{
 			serving.ConfigurationLabelKey: testConfigName,
@@ -189,9 +205,5 @@ func revisionLister(t *testing.T, addLabels bool) servinglisters.RevisionLister 
 		}
 	}
 
-	ctx, _ := rtesting.SetupFakeContext(t)
-	fakeservingclient.Get(ctx).ServingV1alpha1().Revisions(testNamespaceName).Create(rev)
-	ri := fakerevisioninformer.Get(ctx)
-	ri.Informer().GetIndexer().Add(rev)
-	return ri.Lister()
+	return rev
 }

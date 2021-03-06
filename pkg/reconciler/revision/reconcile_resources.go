@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Knative Authors.
+Copyright 2018 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,19 +21,23 @@ import (
 	"fmt"
 
 	"go.uber.org/zap"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"knative.dev/pkg/kmeta"
+	"knative.dev/pkg/kmp"
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/logging/logkey"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/serving/pkg/reconciler/revision/resources"
 	resourcenames "knative.dev/serving/pkg/reconciler/revision/resources/names"
 )
 
-func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revision) error {
+func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1.Revision) error {
 	ns := rev.Namespace
 	deploymentName := resourcenames.Deployment(rev)
 	logger := logging.FromContext(ctx).With(zap.String(logkey.Deployment, deploymentName))
@@ -41,8 +45,8 @@ func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revi
 	deployment, err := c.deploymentLister.Deployments(ns).Get(deploymentName)
 	if apierrs.IsNotFound(err) {
 		// Deployment does not exist. Create it.
-		rev.Status.MarkResourcesAvailableUnknown(v1alpha1.Deploying, "")
-		rev.Status.MarkContainerHealthyUnknown(v1alpha1.Deploying, "")
+		rev.Status.MarkResourcesAvailableUnknown(v1.ReasonDeploying, "")
+		rev.Status.MarkContainerHealthyUnknown(v1.ReasonDeploying, "")
 		deployment, err = c.createDeployment(ctx, rev)
 		if err != nil {
 			return fmt.Errorf("failed to create deployment %q: %w", deploymentName, err)
@@ -52,7 +56,7 @@ func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revi
 		return fmt.Errorf("failed to get deployment %q: %w", deploymentName, err)
 	} else if !metav1.IsControlledBy(deployment, rev) {
 		// Surface an error in the revision's status, and return an error.
-		rev.Status.MarkResourcesAvailableFalse(v1alpha1.NotOwned, v1alpha1.ResourceNotOwnedMessage("Deployment", deploymentName))
+		rev.Status.MarkResourcesAvailableFalse(v1.ReasonNotOwned, v1.ResourceNotOwnedMessage("Deployment", deploymentName))
 		return fmt.Errorf("revision: %q does not own Deployment: %q", rev.Name, deploymentName)
 	} else {
 		// The deployment exists, but make sure that it has the shape that we expect.
@@ -75,14 +79,16 @@ func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revi
 
 	// If a container keeps crashing (no active pods in the deployment although we want some)
 	if *deployment.Spec.Replicas > 0 && deployment.Status.AvailableReplicas == 0 {
-		pods, err := c.KubeClientSet.CoreV1().Pods(ns).List(metav1.ListOptions{LabelSelector: metav1.FormatLabelSelector(deployment.Spec.Selector)})
+		pods, err := c.kubeclient.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: metav1.FormatLabelSelector(deployment.Spec.Selector)})
 		if err != nil {
 			logger.Errorw("Error getting pods", zap.Error(err))
-		} else if len(pods.Items) > 0 {
+			return nil
+		}
+		if len(pods.Items) > 0 {
 			// Arbitrarily grab the very first pod, as they all should be crashing
 			pod := pods.Items[0]
 
-			// Update the revision status if pod cannot be scheduled(possibly resource constraints)
+			// Update the revision status if pod cannot be scheduled (possibly resource constraints)
 			// If pod cannot be scheduled then we expect the container status to be empty.
 			for _, cond := range pod.Status.Conditions {
 				if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
@@ -94,10 +100,10 @@ func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revi
 			for _, status := range pod.Status.ContainerStatuses {
 				if status.Name == rev.Spec.GetContainer().Name {
 					if t := status.LastTerminationState.Terminated; t != nil {
-						logger.Infof("%s marking exiting with: %d/%s", rev.Name, t.ExitCode, t.Message)
-						rev.Status.MarkContainerHealthyFalse(v1alpha1.ExitCodeReason(t.ExitCode), v1alpha1.RevisionContainerExitingMessage(t.Message))
+						logger.Infof("marking exiting with: %d/%s", t.ExitCode, t.Message)
+						rev.Status.MarkContainerHealthyFalse(v1.ExitCodeReason(t.ExitCode), v1.RevisionContainerExitingMessage(t.Message))
 					} else if w := status.State.Waiting; w != nil && hasDeploymentTimedOut(deployment) {
-						logger.Infof("%s marking resources unavailable with: %s: %s", rev.Name, w.Reason, w.Message)
+						logger.Infof("marking resources unavailable with: %s: %s", w.Reason, w.Message)
 						rev.Status.MarkResourcesAvailableFalse(w.Reason, w.Message)
 					}
 					break
@@ -109,26 +115,27 @@ func (c *Reconciler) reconcileDeployment(ctx context.Context, rev *v1alpha1.Revi
 	return nil
 }
 
-func (c *Reconciler) reconcileImageCache(ctx context.Context, rev *v1alpha1.Revision) error {
+func (c *Reconciler) reconcileImageCache(ctx context.Context, rev *v1.Revision) error {
 	logger := logging.FromContext(ctx)
 
 	ns := rev.Namespace
-	imageName := resourcenames.ImageCache(rev)
-	_, err := c.imageLister.Images(ns).Get(imageName)
-	if apierrs.IsNotFound(err) {
-		_, err := c.createImageCache(ctx, rev)
-		if err != nil {
-			return fmt.Errorf("failed to create image cache %q: %w", imageName, err)
+	// Revisions are immutable.
+	// Updating image results to new revision so there won't be any chance of resource leak.
+	for _, container := range rev.Status.ContainerStatuses {
+		imageName := kmeta.ChildName(resourcenames.ImageCache(rev), "-"+container.Name)
+		if _, err := c.imageLister.Images(ns).Get(imageName); apierrs.IsNotFound(err) {
+			if _, err := c.createImageCache(ctx, rev, container.Name, container.ImageDigest); err != nil {
+				return fmt.Errorf("failed to create image cache %q: %w", imageName, err)
+			}
+			logger.Infof("Created image cache %q", imageName)
+		} else if err != nil {
+			return fmt.Errorf("failed to get image cache %q: %w", imageName, err)
 		}
-		logger.Infof("Created image cache %q", imageName)
-	} else if err != nil {
-		return fmt.Errorf("failed to get image cache %q: %w", imageName, err)
 	}
-
 	return nil
 }
 
-func (c *Reconciler) reconcilePA(ctx context.Context, rev *v1alpha1.Revision) error {
+func (c *Reconciler) reconcilePA(ctx context.Context, rev *v1.Revision) error {
 	ns := rev.Namespace
 	paName := resourcenames.PA(rev)
 	logger := logging.FromContext(ctx)
@@ -146,23 +153,30 @@ func (c *Reconciler) reconcilePA(ctx context.Context, rev *v1alpha1.Revision) er
 		return fmt.Errorf("failed to get PA %q: %w", paName, err)
 	} else if !metav1.IsControlledBy(pa, rev) {
 		// Surface an error in the revision's status, and return an error.
-		rev.Status.MarkResourcesAvailableFalse(v1alpha1.NotOwned, v1alpha1.ResourceNotOwnedMessage("PodAutoscaler", paName))
+		rev.Status.MarkResourcesAvailableFalse(v1.ReasonNotOwned, v1.ResourceNotOwnedMessage("PodAutoscaler", paName))
 		return fmt.Errorf("revision: %q does not own PodAutoscaler: %q", rev.Name, paName)
 	}
 
 	// Perhaps tha PA spec changed underneath ourselves?
 	// We no longer require immutability, so need to reconcile PA each time.
 	tmpl := resources.MakePA(rev)
+	logger.Debugf("Desired PASpec: %#v", tmpl.Spec)
 	if !equality.Semantic.DeepEqual(tmpl.Spec, pa.Spec) {
-		logger.Infof("PA %s needs reconciliation", pa.Name)
+		diff, _ := kmp.SafeDiff(tmpl.Spec, pa.Spec) // Can't realistically fail on PASpec.
+		logger.Infof("PA %s needs reconciliation, diff(-want,+got):\n%s", pa.Name, diff)
 
 		want := pa.DeepCopy()
 		want.Spec = tmpl.Spec
-		if pa, err = c.ServingClientSet.AutoscalingV1alpha1().PodAutoscalers(pa.Namespace).Update(want); err != nil {
+		if pa, err = c.client.AutoscalingV1alpha1().PodAutoscalers(ns).Update(ctx, want, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("failed to update PA %q: %w", paName, err)
 		}
 	}
 
+	// The public service name is always equal to the revision name itself.
+	// Historically it's been acquired from the PA object, so the assignment is here.
+	rev.Status.ServiceName = rev.Name
+
+	logger.Debugf("Observed PA Status=%#v", pa.Status)
 	rev.Status.PropagateAutoscalerStatus(&pa.Status)
 	return nil
 }
@@ -170,13 +184,12 @@ func (c *Reconciler) reconcilePA(ctx context.Context, rev *v1alpha1.Revision) er
 func hasDeploymentTimedOut(deployment *appsv1.Deployment) bool {
 	// as per https://kubernetes.io/docs/concepts/workloads/controllers/deployment
 	for _, cond := range deployment.Status.Conditions {
-		// Look for Deployment with status False
+		// Look for a condition with status False
 		if cond.Status != corev1.ConditionFalse {
 			continue
 		}
 		// with Type Progressing and Reason Timeout
-		// TODO(arvtiwar): hard coding "ProgressDeadlineExceeded" to avoid import kubernetes/kubernetes
-		if cond.Type == appsv1.DeploymentProgressing && cond.Reason == "ProgressDeadlineExceeded" {
+		if cond.Type == appsv1.DeploymentProgressing && cond.Reason == v1.ReasonProgressDeadlineExceeded {
 			return true
 		}
 	}

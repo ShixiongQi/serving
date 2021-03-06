@@ -21,14 +21,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"knative.dev/pkg/ptr"
+	"knative.dev/pkg/reconciler"
 	"knative.dev/pkg/test/logging"
 	"knative.dev/pkg/test/spoof"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
-
 	rtesting "knative.dev/serving/pkg/testing/v1"
 	"knative.dev/serving/test"
 )
@@ -57,10 +56,14 @@ func Route(names test.ResourceNames, fopt ...rtesting.RouteOption) *v1.Route {
 }
 
 // CreateRoute creates a route in the given namespace using the route name in names
-func CreateRoute(t *testing.T, clients *test.Clients, names test.ResourceNames, fopt ...rtesting.RouteOption) (*v1.Route, error) {
+func CreateRoute(t testing.TB, clients *test.Clients, names test.ResourceNames, fopt ...rtesting.RouteOption) (rt *v1.Route, err error) {
 	route := Route(names, fopt...)
+	test.AddTestAnnotation(t, route.ObjectMeta)
 	LogResourceObject(t, ResourceObjects{Route: route})
-	return clients.ServingClient.Routes.Create(route)
+	return rt, reconciler.RetryTestErrors(func(int) (err error) {
+		rt, err = clients.ServingClient.Routes.Create(context.Background(), route, metav1.CreateOptions{})
+		return err
+	})
 }
 
 // WaitForRouteState polls the status of the Route called name from client every
@@ -73,8 +76,10 @@ func WaitForRouteState(client *test.ServingClients, name string, inState func(r 
 
 	var lastState *v1.Route
 	waitErr := wait.PollImmediate(test.PollInterval, test.PollTimeout, func() (bool, error) {
-		var err error
-		lastState, err = client.Routes.Get(name, metav1.GetOptions{})
+		err := reconciler.RetryTestErrors(func(int) (err error) {
+			lastState, err = client.Routes.Get(context.Background(), name, metav1.GetOptions{})
+			return err
+		})
 		if err != nil {
 			return true, err
 		}
@@ -91,7 +96,11 @@ func WaitForRouteState(client *test.ServingClients, name string, inState func(r 
 // is in a particular state by calling `inState` and expecting `true`.
 // This is the non-polling variety of WaitForRouteState
 func CheckRouteState(client *test.ServingClients, name string, inState func(r *v1.Route) (bool, error)) error {
-	r, err := client.Routes.Get(name, metav1.GetOptions{})
+	var r *v1.Route
+	err := reconciler.RetryTestErrors(func(int) (err error) {
+		r, err = client.Routes.Get(context.Background(), name, metav1.GetOptions{})
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -106,13 +115,13 @@ func CheckRouteState(client *test.ServingClients, name string, inState func(r *v
 // IsRouteReady will check the status conditions of the route and return true if the route is
 // ready.
 func IsRouteReady(r *v1.Route) (bool, error) {
-	return r.Generation == r.Status.ObservedGeneration && r.Status.IsReady(), nil
+	return r.IsReady(), nil
 }
 
-// IsRouteNotReady will check the status conditions of the route and return true if the route is
+// IsRouteFailed will check the status conditions of the route and return true if the route is
 // not ready.
-func IsRouteNotReady(r *v1.Route) (bool, error) {
-	return !r.Status.IsReady(), nil
+func IsRouteFailed(r *v1.Route) (bool, error) {
+	return r.IsFailed(), nil
 }
 
 // RetryingRouteInconsistency retries common requests seen when creating a new route
@@ -128,15 +137,7 @@ func RetryingRouteInconsistency(innerCheck spoof.ResponseChecker) spoof.Response
 func AllRouteTrafficAtRevision(names test.ResourceNames) func(r *v1.Route) (bool, error) {
 	return func(r *v1.Route) (bool, error) {
 		for _, tt := range r.Status.Traffic {
-			if tt.Percent != nil && *tt.Percent == 100 {
-				if tt.RevisionName != names.Revision {
-					return true, fmt.Errorf("expected traffic revision name to be %s but actually is %s: %s", names.Revision, tt.RevisionName, spew.Sprint(r))
-				}
-
-				if tt.Tag != names.TrafficTarget {
-					return true, fmt.Errorf("expected traffic target name to be %s but actually is %s: %s", names.TrafficTarget, tt.Tag, spew.Sprint(r))
-				}
-
+			if tt.Percent != nil && *tt.Percent == 100 && tt.RevisionName == names.Revision && tt.Tag == names.TrafficTarget {
 				return true, nil
 			}
 		}

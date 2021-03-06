@@ -20,16 +20,14 @@ import (
 	"context"
 	"testing"
 
+	"knative.dev/pkg/apis"
 	"knative.dev/pkg/ptr"
 	"knative.dev/serving/pkg/apis/config"
 	"knative.dev/serving/pkg/apis/serving"
-	routeconfig "knative.dev/serving/pkg/reconciler/route/config"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"knative.dev/pkg/apis"
 )
 
 func TestConfigurationValidation(t *testing.T) {
@@ -101,6 +99,28 @@ func TestConfigurationValidation(t *testing.T) {
 		},
 		want: nil,
 	}, {
+		name: "invalid name",
+		c: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "",
+			},
+			Spec: ConfigurationSpec{
+				Template: RevisionTemplateSpec{
+					Spec: RevisionSpec{
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Image: "hellworld",
+							}},
+						},
+					},
+				},
+			},
+		},
+		want: &apis.FieldError{
+			Message: "name or generateName is required",
+			Paths:   []string{"metadata.name"},
+		},
+	}, {
 		name: "valid BYO name (with generateName)",
 		c: &Configuration{
 			ObjectMeta: metav1.ObjectMeta{
@@ -121,7 +141,7 @@ func TestConfigurationValidation(t *testing.T) {
 				},
 			},
 		},
-		want: nil,
+		want: apis.ErrDisallowedFields("spec.template.metadata.name"),
 	}, {
 		name: "invalid BYO name (not prefixed)",
 		c: &Configuration{
@@ -145,6 +165,96 @@ func TestConfigurationValidation(t *testing.T) {
 		},
 		want: apis.ErrInvalidValue(`"foo" must have prefix "byo-name-"`,
 			"spec.template.metadata.name"),
+	}, {
+		name: "invalid name for configuration spec",
+		c: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ConfigurationSpec{
+				Template: RevisionTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "foo.bar",
+					},
+					Spec: RevisionSpec{
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Image: "hellworld",
+							}},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidValue("not a DNS 1035 label: [a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]",
+			"spec.template.metadata.name"),
+	}, {
+		name: "invalid generate name for configuration spec",
+		c: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ConfigurationSpec{
+				Template: RevisionTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						GenerateName: "foo.bar",
+					},
+					Spec: RevisionSpec{
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Image: "hellworld",
+							}},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidValue("not a DNS 1035 label prefix: [a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]",
+			"spec.template.metadata.generateName"),
+	}, {
+		name: "valid generate name for configuration spec",
+		c: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ConfigurationSpec{
+				Template: RevisionTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						GenerateName: "valid-generatename",
+					},
+					Spec: RevisionSpec{
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Image: "hellworld",
+							}},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "invalid autoscaling.knative.dev annotation",
+		c: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "autoscaling-annotation",
+				Annotations: map[string]string{
+					"autoscaling.knative.dev/foo": "bar",
+				},
+			},
+			Spec: ConfigurationSpec{
+				Template: RevisionTemplateSpec{
+					Spec: RevisionSpec{
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Image: "hellworld",
+							}},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidKeyName("autoscaling.knative.dev/foo", "metadata.annotations", `autoscaling annotations must be put under "spec.template.metadata.annotations" to work`),
 	}}
 
 	// TODO(dangerd): PodSpec validation failures.
@@ -180,30 +290,6 @@ func TestConfigurationLabelValidation(t *testing.T) {
 		c    *Configuration
 		want *apis.FieldError
 	}{{
-		name: "valid visibility name",
-		c: &Configuration{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "byo-name",
-				Labels: map[string]string{
-					routeconfig.VisibilityLabelKey: "cluster-local",
-				},
-			},
-			Spec: validConfigSpec,
-		},
-		want: nil,
-	}, {
-		name: "invalid visibility name",
-		c: &Configuration{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "byo-name",
-				Labels: map[string]string{
-					routeconfig.VisibilityLabelKey: "bad-value",
-				},
-			},
-			Spec: validConfigSpec,
-		},
-		want: apis.ErrInvalidValue("bad-value", "metadata.labels.serving.knative.dev/visibility"),
-	}, {
 		name: "valid route name",
 		c: &Configuration{
 			ObjectMeta: metav1.ObjectMeta{
@@ -299,7 +385,9 @@ func TestConfigurationLabelValidation(t *testing.T) {
 		},
 		want: apis.ErrMissingField("metadata.labels.serving.knative.dev/service"),
 	}, {
-		name: "invalid knative label",
+		// We want to be able to introduce new labels with the serving prefix in the future
+		// and not break downgrading.
+		name: "allow unknown uses of knative.dev/serving prefix",
 		c: &Configuration{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "byo-name",
@@ -309,8 +397,9 @@ func TestConfigurationLabelValidation(t *testing.T) {
 			},
 			Spec: validConfigSpec,
 		},
-		want: apis.ErrInvalidKeyName("serving.knative.dev/testlabel", "metadata.labels"),
+		want: nil,
 	}}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.c.Validate(context.Background())
@@ -604,7 +693,7 @@ func TestConfigurationSubresourceUpdate(t *testing.T) {
 			ctx = apis.WithinSubResourceUpdate(ctx, test.config, test.subresource)
 			got := test.config.Validate(ctx)
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
-				t.Errorf("Validate (-want, +got) = %v", diff)
+				t.Error("Validate (-want, +got) =", diff)
 			}
 		})
 	}
@@ -730,13 +819,67 @@ func TestConfigurationAnnotationUpdate(t *testing.T) {
 			Spec: getConfigurationSpec("helloworld:foo"),
 		},
 		want: nil,
+	}, {
+		name: "no validation for lastModifier annotation even after update without spec changes as configuration owned by service",
+		this: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+				Annotations: map[string]string{
+					serving.CreatorAnnotation: u1,
+					serving.UpdaterAnnotation: u3,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "v1",
+					Kind:       serving.GroupName,
+				}},
+			},
+			Spec: getConfigurationSpec("helloworld:foo"),
+		},
+		prev: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+				Annotations: map[string]string{
+					serving.CreatorAnnotation: u1,
+					serving.UpdaterAnnotation: u1,
+				},
+			},
+			Spec: getConfigurationSpec("helloworld:foo"),
+		},
+		want: nil,
+	}, {
+		name: "no validation for creator annotation even after update as configuration owned by service",
+		this: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+				Annotations: map[string]string{
+					serving.CreatorAnnotation: u3,
+					serving.UpdaterAnnotation: u1,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "v1",
+					Kind:       serving.GroupName,
+				}},
+			},
+			Spec: getConfigurationSpec("helloworld:foo"),
+		},
+		prev: &Configuration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+				Annotations: map[string]string{
+					serving.CreatorAnnotation: u1,
+					serving.UpdaterAnnotation: u1,
+				},
+			},
+			Spec: getConfigurationSpec("helloworld:foo"),
+		},
+		want: nil,
 	}}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			ctx = apis.WithinUpdate(ctx, test.prev)
 			if diff := cmp.Diff(test.want.Error(), test.this.Validate(ctx).Error()); diff != "" {
-				t.Errorf("Validate (-want, +got) = %v", diff)
+				t.Error("Validate (-want, +got) =", diff)
 			}
 		})
 	}

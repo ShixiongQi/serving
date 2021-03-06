@@ -20,63 +20,74 @@ limitations under the License.
 package test
 
 import (
+	"bytes"
 	"flag"
-	"fmt"
-	"os"
 	"os/user"
-	"path"
+	"path/filepath"
+	"text/template"
+
+	"knative.dev/pkg/injection"
+	testflags "knative.dev/pkg/test/flags"
+	"knative.dev/pkg/test/logging"
 )
 
-// Flags holds the command line flags or defaults for settings in the user's environment.
-// See EnvironmentFlags for a list of supported fields.
-var Flags = initializeFlags()
+var (
+	// Flags holds the command line flags or defaults for settings in the user's environment.
+	// See EnvironmentFlags for a list of supported fields.
+	// Deprecated: use test/flags.Flags()
+	Flags = initializeFlags()
+)
 
 // EnvironmentFlags define the flags that are needed to run the e2e tests.
+// Deprecated: use test/flags.Flags() or injection.Flags()
 type EnvironmentFlags struct {
-	Cluster         string // K8s cluster (defaults to cluster in kubeconfig)
-	Kubeconfig      string // Path to kubeconfig (defaults to ./kube/config)
-	Namespace       string // K8s namespace (blank by default, to be overwritten by test suite)
-	IngressEndpoint string // Host to use for ingress endpoint
-	LogVerbose      bool   // Enable verbose logging
-	EmitMetrics     bool   // Emit metrics
-	DockerRepo      string // Docker repo (defaults to $KO_DOCKER_REPO)
-	Tag             string // Tag for test images
+	*injection.Environment
+	*testflags.TestEnvironment
 }
 
 func initializeFlags() *EnvironmentFlags {
-	var f EnvironmentFlags
-	flag.StringVar(&f.Cluster, "cluster", "",
-		"Provide the cluster to test against. Defaults to the current cluster in kubeconfig.")
+	f := new(EnvironmentFlags)
 
-	var defaultKubeconfig string
-	if usr, err := user.Current(); err == nil {
-		defaultKubeconfig = path.Join(usr.HomeDir, ".kube/config")
+	testflags.InitFlags(flag.CommandLine)
+
+	f.TestEnvironment = testflags.Flags()
+	f.Environment = injection.Flags()
+
+	// We want to do this defaulting for tests only. The flags are reused between tests
+	// and production code and we want to make sure that production code defaults to
+	// the in-cluster config correctly.
+	if f.Environment.Kubeconfig == "" {
+		if usr, err := user.Current(); err == nil {
+			f.Environment.Kubeconfig = filepath.Join(usr.HomeDir, ".kube", "config")
+		}
 	}
 
-	flag.StringVar(&f.Kubeconfig, "kubeconfig", defaultKubeconfig,
-		"Provide the path to the `kubeconfig` file you'd like to use for these tests. The `current-context` will be used.")
-
-	flag.StringVar(&f.Namespace, "namespace", "",
-		"Provide the namespace you would like to use for these tests.")
-
-	flag.StringVar(&f.IngressEndpoint, "ingressendpoint", "", "Provide a static endpoint url to the ingress server used during tests.")
-
-	flag.BoolVar(&f.LogVerbose, "logverbose", false,
-		"Set this flag to true if you would like to see verbose logging.")
-
-	flag.BoolVar(&f.EmitMetrics, "emitmetrics", false,
-		"Set this flag to true if you would like tests to emit metrics, e.g. latency of resources being realized in the system.")
-
-	defaultRepo := os.Getenv("KO_DOCKER_REPO")
-	flag.StringVar(&f.DockerRepo, "dockerrepo", defaultRepo,
-		"Provide the uri of the docker repo you have uploaded the test image to using `uploadtestimage.sh`. Defaults to $KO_DOCKER_REPO")
-
-	flag.StringVar(&f.Tag, "tag", "latest", "Provide the version tag for the test images.")
-
-	return &f
+	return f
 }
 
-// ImagePath is a helper function to prefix image name with repo and suffix with tag
+// TODO(coryrc): Remove once other repos are moved to call logging.InitializeLogger() directly
+func SetupLoggingFlags() {
+	logging.InitializeLogger()
+}
+
+// ImagePath is a helper function to transform an image name into an image reference that can be pulled.
 func ImagePath(name string) string {
-	return fmt.Sprintf("%s/%s:%s", Flags.DockerRepo, name, Flags.Tag)
+	tpl, err := template.New("image").Parse(testflags.Flags().ImageTemplate)
+	if err != nil {
+		panic("could not parse image template: " + err.Error())
+	}
+
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, struct {
+		Repository string
+		Name       string
+		Tag        string
+	}{
+		Repository: testflags.Flags().DockerRepo,
+		Name:       name,
+		Tag:        testflags.Flags().Tag,
+	}); err != nil {
+		panic("could not apply the image template: " + err.Error())
+	}
+	return buf.String()
 }

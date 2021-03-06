@@ -23,7 +23,7 @@ spec:
       containers:
       - # This is the Go import path for the binary to containerize
         # and substitute here.
-        image: knative.dev/serving/test/test_images/hellovolume
+        image: ko://knative.dev/serving/test/test_images/hellovolume
         volumeMounts:
         - name: foo
           mountPath: /hello/
@@ -35,6 +35,10 @@ spec:
               name: bar
           - configMap:
               name: baz
+          - serviceAccountToken:
+              audience: api
+              expirationSeconds: 3600
+              path: token
 ---
 apiVersion: v1
 kind: Secret

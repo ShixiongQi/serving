@@ -22,12 +22,16 @@ import (
 	"log"
 	"time"
 
-	vegeta "github.com/tsenart/vegeta/lib"
+	vegeta "github.com/tsenart/vegeta/v12/lib"
+
 	"knative.dev/pkg/signals"
+	"knative.dev/pkg/system"
 	"knative.dev/pkg/test/mako"
 
 	"knative.dev/serving/test/performance"
 	"knative.dev/serving/test/performance/metrics"
+
+	_ "knative.dev/pkg/system/testing"
 )
 
 var (
@@ -49,7 +53,7 @@ func main() {
 	// Use the benchmark key created
 	mc, err := mako.Setup(ctx)
 	if err != nil {
-		log.Fatalf("Failed to setup mako: %v", err)
+		log.Fatal("Failed to setup mako: ", err)
 	}
 	q, qclose, ctx := mc.Quickstore, mc.ShutDownFunc, mc.Context
 	// Use a fresh context here so that our RPC to terminate the sidecar
@@ -96,7 +100,7 @@ func main() {
 
 	// Start the attack!
 	results := attacker.Attack(targeter, rate, *duration, "load-test")
-
+	deploymentStatus := metrics.FetchDeploymentStatus(ctx, system.Namespace(), "activator", time.Second)
 LOOP:
 	for {
 		select {
@@ -105,6 +109,11 @@ LOOP:
 			// clean thing up.
 			break LOOP
 
+		case ds := <-deploymentStatus:
+			// Report number of ready activators.
+			q.AddSamplePoint(mako.XTime(ds.Time), map[string]float64{
+				"ap": float64(ds.ReadyReplicas),
+			})
 		case res, ok := <-results:
 			if !ok {
 				// Once we have read all of the request results, break out of

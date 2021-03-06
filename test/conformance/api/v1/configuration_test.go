@@ -19,10 +19,12 @@ limitations under the License.
 package v1
 
 import (
-	"reflect"
+	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/kmeta"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
 	"knative.dev/serving/test"
 	v1test "knative.dev/serving/test/v1"
@@ -37,37 +39,29 @@ func TestUpdateConfigurationMetadata(t *testing.T) {
 		Image:  test.PizzaPlanet1,
 	}
 
-	defer test.TearDown(clients, names)
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
+	test.EnsureTearDown(t, clients, &names)
 
-	t.Logf("Creating new configuration %s", names.Config)
+	t.Log("Creating new configuration", names.Config)
 	if _, err := v1test.CreateConfiguration(t, clients, names); err != nil {
-		t.Fatalf("Failed to create configuration %s", names.Config)
+		t.Fatal("Failed to create configuration", names.Config)
 	}
 
-	t.Log("The Configuration will be updated with the name of the Revision once it is created")
-	var err error
-	names.Revision, err = waitForConfigurationLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Configuration %s was not updated with the new revision: %v", names.Config, err)
+	// Wait for the configuration to actually be ready to not race in the updates below.
+	if err := v1test.WaitForConfigurationState(clients.ServingClient, names.Config, v1test.IsConfigurationReady, "ConfigurationIsReady"); err != nil {
+		t.Fatalf("Configuration %s did not become ready: %v", names.Config, err)
 	}
 
 	cfg := fetchConfiguration(names.Config, clients, t)
+	names.Revision = cfg.Status.LatestReadyRevisionName
 
-	t.Logf("Updating labels of Configuration %s", names.Config)
+	t.Log("Updating labels of Configuration", names.Config)
 	newLabels := map[string]string{
 		"labelX": "abc",
 		"labelY": "def",
 	}
 	// Copy over new labels.
-	if cfg.Labels == nil {
-		cfg.Labels = newLabels
-	} else {
-		for k, v := range newLabels {
-			cfg.Labels[k] = v
-		}
-	}
-	cfg, err = clients.ServingClient.Configs.Update(cfg)
+	cfg.Labels = kmeta.UnionMaps(cfg.Labels, newLabels)
+	cfg, err := clients.ServingClient.Configs.Update(context.Background(), cfg, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("Failed to update labels for Configuration %s: %v", names.Config, err)
 	}
@@ -84,7 +78,7 @@ func TestUpdateConfigurationMetadata(t *testing.T) {
 			names.Config, expected, actual)
 	}
 
-	t.Logf("Validating labels were not propagated to Revision %s", names.Revision)
+	t.Log("Validating labels were not propagated to Revision", names.Revision)
 	err = v1test.CheckRevisionState(clients.ServingClient, names.Revision, func(r *v1.Revision) (bool, error) {
 		// Labels we placed on Configuration should _not_ appear on Revision.
 		return checkNoKeysPresent(newLabels, r.Labels, t), nil
@@ -93,20 +87,13 @@ func TestUpdateConfigurationMetadata(t *testing.T) {
 		t.Errorf("The labels for Revision %s of Configuration %s should not have been updated: %v", names.Revision, names.Config, err)
 	}
 
-	t.Logf("Updating annotations of Configuration %s", names.Config)
+	t.Log("Updating annotations of Configuration", names.Config)
 	newAnnotations := map[string]string{
 		"annotationA": "123",
 		"annotationB": "456",
 	}
-	if cfg.Annotations == nil {
-		cfg.Annotations = newAnnotations
-	} else {
-		// Copy over new annotations.
-		for k, v := range newAnnotations {
-			cfg.Annotations[k] = v
-		}
-	}
-	cfg, err = clients.ServingClient.Configs.Update(cfg)
+	cfg.Annotations = kmeta.UnionMaps(cfg.Annotations, newAnnotations)
+	cfg, err = clients.ServingClient.Configs.Update(context.Background(), cfg, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("Failed to update annotations for Configuration %s: %v", names.Config, err)
 	}
@@ -122,7 +109,7 @@ func TestUpdateConfigurationMetadata(t *testing.T) {
 			names.Config, expected, actual)
 	}
 
-	t.Logf("Validating annotations were not propagated to Revision %s", names.Revision)
+	t.Log("Validating annotations were not propagated to Revision", names.Revision)
 	err = v1test.CheckRevisionState(clients.ServingClient, names.Revision, func(r *v1.Revision) (bool, error) {
 		// Annotations we placed on Configuration should _not_ appear on Revision.
 		return checkNoKeysPresent(newAnnotations, r.Annotations, t), nil
@@ -133,40 +120,28 @@ func TestUpdateConfigurationMetadata(t *testing.T) {
 }
 
 func fetchConfiguration(name string, clients *test.Clients, t *testing.T) *v1.Configuration {
-	cfg, err := clients.ServingClient.Configs.Get(name, metav1.GetOptions{})
+	cfg, err := clients.ServingClient.Configs.Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Failed to get configuration %s: %v", name, err)
 	}
 	return cfg
 }
 
-func waitForConfigurationLatestCreatedRevision(clients *test.Clients, names test.ResourceNames) (string, error) {
-	var revisionName string
-	err := v1test.WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
-		if c.Status.LatestCreatedRevisionName != names.Revision {
-			revisionName = c.Status.LatestCreatedRevisionName
-			return true, nil
-		}
-		return false, nil
-	}, "ConfigurationUpdatedWithRevision")
-	return revisionName, err
-}
-
 func waitForConfigurationLabelsUpdate(clients *test.Clients, names test.ResourceNames, labels map[string]string) error {
 	return v1test.WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
-		return reflect.DeepEqual(c.Labels, labels) && c.Generation == c.Status.ObservedGeneration, nil
+		return cmp.Equal(c.Labels, labels) && c.Generation == c.Status.ObservedGeneration, nil
 	}, "ConfigurationMetadataUpdatedWithLabels")
 }
 
 func waitForConfigurationAnnotationsUpdate(clients *test.Clients, names test.ResourceNames, annotations map[string]string) error {
 	return v1test.WaitForConfigurationState(clients.ServingClient, names.Config, func(c *v1.Configuration) (bool, error) {
-		return reflect.DeepEqual(c.Annotations, annotations) && c.Generation == c.Status.ObservedGeneration, nil
+		return cmp.Equal(c.Annotations, annotations) && c.Generation == c.Status.ObservedGeneration, nil
 	}, "ConfigurationMetadataUpdatedWithAnnotations")
 }
 
 // checkNoKeysPresent returns true if _no_ keys from `expected`, are present in `actual`.
 // checkNoKeysPresent will log the offending keys to t.Log.
-func checkNoKeysPresent(expected map[string]string, actual map[string]string, t *testing.T) bool {
+func checkNoKeysPresent(expected, actual map[string]string, t *testing.T) bool {
 	t.Helper()
 	present := []string{}
 	for k := range expected {
@@ -175,7 +150,7 @@ func checkNoKeysPresent(expected map[string]string, actual map[string]string, t 
 		}
 	}
 	if len(present) != 0 {
-		t.Logf("Unexpected keys: %v", present)
+		t.Log("Unexpected keys:", present)
 	}
 	return len(present) == 0
 }

@@ -18,10 +18,10 @@ package mako
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"cloud.google.com/go/compute/metadata"
@@ -44,7 +44,7 @@ const (
 	// assorted preprocessing.
 	sidecarAddress = "localhost:9813"
 
-	// org is the orgnization name that is used by Github client
+	// org is the organization name that is used by Github client
 	org = "knative"
 
 	// slackUserName is the slack user name that is used by Slack client
@@ -77,13 +77,15 @@ func (c *Client) StoreAndHandleResult() error {
 	return c.alerter.HandleBenchmarkResult(c.benchmarkKey, c.benchmarkName, out, err)
 }
 
+var tagEscaper = strings.NewReplacer("+", "-", "\t", "_", " ", "_")
+
 // EscapeTag replaces characters that Mako doesn't accept with ones it does.
 func EscapeTag(tag string) string {
-	return strings.ReplaceAll(tag, ".", "_")
+	return tagEscaper.Replace(tag)
 }
 
 // SetupHelper sets up the mako client for the provided benchmarkKey.
-// It will add a few common tags and allow each benchmark to add custm tags as well.
+// It will add a few common tags and allow each benchmark to add custom tags as well.
 // It returns the mako client handle to store metrics, a method to close the connection
 // to mako server once done and error in case of failures.
 func SetupHelper(ctx context.Context, benchmarkKey *string, benchmarkName *string, extraTags ...string) (*Client, error) {
@@ -91,7 +93,7 @@ func SetupHelper(ctx context.Context, benchmarkKey *string, benchmarkName *strin
 	// Get the commit of the benchmarks
 	commitID, err := changeset.Get()
 	if err != nil {
-		return nil, err
+		log.Println("Cannot find commit ID")
 	}
 
 	// Setup a deployment informer, so that we can use the lister to track
@@ -113,37 +115,38 @@ func SetupHelper(ctx context.Context, benchmarkKey *string, benchmarkName *strin
 	}
 
 	// Determine the number of Kubernetes nodes through the kubernetes client.
-	nodes, err := kc.CoreV1().Nodes().List(metav1.ListOptions{})
+	nodes, err := kc.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
-	tags = append(tags, "nodes="+fmt.Sprintf("%d", len(nodes.Items)))
+	tags = append(tags, "nodes="+strconv.Itoa(len(nodes.Items)))
 
 	// Decorate GCP metadata as tags (when we're running on GCP).
 	if projectID, err := metadata.ProjectID(); err != nil {
-		log.Printf("GCP project ID is not available: %v", err)
+		log.Print("GCP project ID is not available: ", err)
 	} else {
 		tags = append(tags, "project-id="+EscapeTag(projectID))
 	}
 	if zone, err := metadata.Zone(); err != nil {
-		log.Printf("GCP zone is not available: %v", err)
+		log.Print("GCP zone is not available: ", err)
 	} else {
 		tags = append(tags, "zone="+EscapeTag(zone))
 	}
 	if machineType, err := metadata.Get("instance/machine-type"); err != nil {
-		log.Printf("GCP machine type is not available: %v", err)
+		log.Print("GCP machine type is not available: ", err)
 	} else if parts := strings.Split(machineType, "/"); len(parts) != 4 {
 		tags = append(tags, "instanceType="+EscapeTag(parts[3]))
 	}
-
+	tags = append(tags,
+		"commit="+commitID,
+		"kubernetes="+EscapeTag(version.String()),
+		"goversion="+EscapeTag(runtime.Version()),
+	)
+	log.Printf("The tags for this run are: %+v", tags)
 	// Create a new Quickstore that connects to the microservice
 	qs, qclose, err := quickstore.NewAtAddress(ctx, &qpb.QuickstoreInput{
 		BenchmarkKey: benchmarkKey,
-		Tags: append(tags,
-			"commit="+commitID,
-			"kubernetes="+EscapeTag(version.String()),
-			EscapeTag(runtime.Version()),
-		),
+		Tags:         tags,
 	}, sidecarAddress)
 	if err != nil {
 		return nil, err
@@ -176,12 +179,8 @@ func SetupHelper(ctx context.Context, benchmarkKey *string, benchmarkName *strin
 }
 
 func Setup(ctx context.Context, extraTags ...string) (*Client, error) {
-	benchmarkKey, benchmarkName := config.MustGetBenchmark()
-	return SetupHelper(ctx, benchmarkKey, benchmarkName, extraTags...)
-}
-
-func SetupWithBenchmarkConfig(ctx context.Context, benchmarkKey *string, benchmarkName *string, extraTags ...string) (*Client, error) {
-	return SetupHelper(ctx, benchmarkKey, benchmarkName, extraTags...)
+	bench := config.MustGetBenchmark()
+	return SetupHelper(ctx, bench.BenchmarkKey, bench.BenchmarkName, extraTags...)
 }
 
 func tokenPath(token string) string {

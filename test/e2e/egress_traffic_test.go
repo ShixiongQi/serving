@@ -19,14 +19,15 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
 	"testing"
 
-	pkgTest "knative.dev/pkg/test"
-	v1a1opts "knative.dev/serving/pkg/testing/v1alpha1"
-	"knative.dev/serving/test"
-	v1a1test "knative.dev/serving/test/v1alpha1"
-
 	corev1 "k8s.io/api/core/v1"
+	pkgTest "knative.dev/pkg/test"
+	"knative.dev/pkg/test/spoof"
+	rtesting "knative.dev/serving/pkg/testing/v1"
+	"knative.dev/serving/test"
+	v1test "knative.dev/serving/test/v1"
 )
 
 const (
@@ -42,32 +43,33 @@ func TestEgressTraffic(t *testing.T) {
 		Service: test.ObjectNameForTest(t),
 		Image:   "httpproxy",
 	}
-	envVars := []corev1.EnvVar{{
-		Name:  targetHostEnvName,
-		Value: targetHostDomain,
-	}}
-	defer test.TearDown(clients, names)
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
+	test.EnsureTearDown(t, clients, &names)
 
-	service, _, err := v1a1test.CreateRunLatestServiceReady(t, clients, &names,
-		false /* https TODO(taragu) turn this on after helloworld test running with https */,
-		v1a1opts.WithEnv(envVars...))
+	service, err := v1test.CreateServiceReady(t, clients, &names,
+		rtesting.WithEnv(corev1.EnvVar{
+			Name:  targetHostEnvName,
+			Value: targetHostDomain,
+		}))
+
 	if err != nil {
-		t.Fatalf("Failed to create a service: %v", err)
+		t.Fatal("Failed to create a service:", err)
 	}
 	if service.Route.Status.URL == nil {
 		t.Fatalf("Can't get internal request domain: service.Route.Status.URL is nil")
 	}
-	t.Log(service.Route.Status.URL.String())
+	t.Log("Service URL: " + service.Route.Status.URL.String())
 
 	url := service.Route.Status.URL.URL()
 	if _, err = pkgTest.WaitForEndpointState(
+		context.Background(),
 		clients.KubeClient,
 		t.Logf,
 		url,
-		v1a1test.RetryingRouteInconsistency(pkgTest.IsStatusOK),
+		v1test.RetryingRouteInconsistency(spoof.IsStatusOK),
 		"HTTPProxy",
-		test.ServingFlags.ResolvableDomain); err != nil {
-		t.Fatalf("Failed to send request to httpproxy: %v", err)
+		test.ServingFlags.ResolvableDomain,
+		test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS),
+	); err != nil {
+		t.Error("Failed to send request to httpproxy:", err)
 	}
 }

@@ -19,49 +19,36 @@ package labeler
 import (
 	"context"
 
-	"go.uber.org/zap"
-	apierrs "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/tools/cache"
-	"knative.dev/pkg/controller"
-	"knative.dev/pkg/logging"
-	listers "knative.dev/serving/pkg/client/listers/serving/v1alpha1"
-	"knative.dev/serving/pkg/reconciler"
+	pkgreconciler "knative.dev/pkg/reconciler"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	routereconciler "knative.dev/serving/pkg/client/injection/reconciler/serving/v1/route"
 )
 
 // Reconciler implements controller.Reconciler for Route resources.
 type Reconciler struct {
-	*reconciler.Base
-
-	// Listers index properties about resources
-	routeLister         listers.RouteLister
-	configurationLister listers.ConfigurationLister
-	revisionLister      listers.RevisionLister
+	caccV2 *configurationAccessor
+	raccV2 *revisionAccessor
 }
 
-// Check that our Reconciler implements controller.Reconciler
-var _ controller.Reconciler = (*Reconciler)(nil)
+// Check that our Reconciler implements routereconciler.Interface
+var _ routereconciler.Interface = (*Reconciler)(nil)
+var _ routereconciler.Finalizer = (*Reconciler)(nil)
 
-// Reconcile compares the actual state with the desired, and attempts to
-// converge the two. In this case, it attempts to label all Configurations
-// with the Routes that direct traffic to their Revisions.
-func (c *Reconciler) Reconcile(ctx context.Context, key string) error {
-	logger := logging.FromContext(ctx)
-
-	namespace, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		logger.Errorw("Invalid resource key", zap.Error(err))
-		return nil
+// FinalizeKind removes all Route reference metadata from its traffic targets.
+// This does not modify or observe spec for the Route itself.
+func (rec *Reconciler) FinalizeKind(ctx context.Context, r *v1.Route) pkgreconciler.Event {
+	if err := clearRoutingMeta(ctx, r, rec.caccV2, rec.raccV2); err != nil {
+		return err
 	}
+	return nil
+}
 
-	// Get the Route resource with this namespace/name
-	route, err := c.routeLister.Routes(namespace).Get(name)
-	if apierrs.IsNotFound(err) {
-		logger.Infof("Clearing labels for deleted Route: %q", key)
-		return c.clearLabels(ctx, namespace, name)
-	} else if err != nil {
+// ReconcileKind syncs the Route reference metadata to its traffic targets.
+// This does not modify or observe spec for the Route itself.
+func (rec *Reconciler) ReconcileKind(ctx context.Context, r *v1.Route) pkgreconciler.Event {
+	if err := syncRoutingMeta(ctx, r, rec.caccV2, rec.raccV2); err != nil {
 		return err
 	}
 
-	logger.Infof("Time to sync the labels: %#v", route)
-	return c.syncLabels(ctx, route)
+	return nil
 }

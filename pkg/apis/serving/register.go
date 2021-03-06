@@ -16,6 +16,8 @@ limitations under the License.
 
 package serving
 
+import "k8s.io/apimachinery/pkg/runtime/schema"
+
 const (
 	// GroupName is the group name for knative labels and annotations
 	GroupName = "serving.knative.dev"
@@ -31,13 +33,37 @@ const (
 	// pinned a revision
 	RevisionLastPinnedAnnotationKey = GroupName + "/lastPinned"
 
+	// RevisionPreservedAnnotationKey is the annotation key used for preventing garbage collector
+	// from automatically deleting the revision.
+	RevisionPreservedAnnotationKey = GroupName + "/no-gc"
+
 	// RouteLabelKey is the label key attached to a Configuration indicating by
 	// which Route it is configured as traffic target.
+	// The key is also attached to Revision resources to indicate they are directly
+	// referenced by a Route, or are a child of a Configuration which is referenced by a Route.
 	// The key can also be attached to Ingress resources to indicate
 	// which Route triggered their creation.
 	// The key is also attached to k8s Service resources to indicate which Route
 	// triggered their creation.
 	RouteLabelKey = GroupName + "/route"
+
+	// RoutesAnnotationKey is an annotation attached to a Revision to indicate that it is
+	// referenced by one or many routes. The value is a comma separated list of Route names.
+	RoutesAnnotationKey = GroupName + "/routes"
+
+	// RolloutDurationKey is an annotation attached to a Route to indicate the duration
+	// of the rollout of the latest revision. The value must be a valid positive
+	// Golang time.Duration value serialized to string.
+	// The value can be specified with at most with a second precision.
+	RolloutDurationKey = GroupName + "/rolloutDuration"
+
+	// RoutingStateLabelKey is the label attached to a Revision indicating
+	// its state in relation to serving a Route.
+	RoutingStateLabelKey = GroupName + "/routingState"
+
+	// RoutingStateModifiedAnnotationKey indicates the last time the RoutingStateLabel
+	// was modified. This is used for ordering when Garbage Collecting old Revisions.
+	RoutingStateModifiedAnnotationKey = GroupName + "/routingStateModified"
 
 	// RouteNamespaceLabelKey is the label key attached to a Ingress
 	// by a Route to indicate which namespace the Route was created in.
@@ -51,9 +77,26 @@ const (
 	// its unique identifier
 	RevisionUID = GroupName + "/revisionUID"
 
+	// ConfigurationUIDLabelKey is the label key attached to a pod to reference its
+	// Knative Configuration by its unique UID
+	ConfigurationUIDLabelKey = GroupName + "/configurationUID"
+
+	// ServiceUIDLabelKey is the label key attached to a pod to reference its
+	// Knative Service by its unique UID
+	ServiceUIDLabelKey = GroupName + "/serviceUID"
+
 	// ServiceLabelKey is the label key attached to a Route and Configuration indicating by
 	// which Service they are created.
 	ServiceLabelKey = GroupName + "/service"
+
+	// DomainMappingLabelKey is the label key attached to Ingress resources to indicate
+	// which DomainMapping triggered their creation.
+	DomainMappingLabelKey = GroupName + "/domainMapping"
+
+	// DomainMappingNamespaceLabelKey is the label key attached to Ingress
+	// resources created by a DomainMapping to indicate which namespace the
+	// DomainMapping was created in.
+	DomainMappingNamespaceLabelKey = GroupName + "/domainMappingNamespace"
 
 	// ConfigurationGenerationLabelKey is the label key attached to a Revision indicating the
 	// metadata generation of the Configuration that created this revision
@@ -69,4 +112,35 @@ const (
 	// QueueSideCarResourcePercentageAnnotation is the percentage of user container resources to be used for queue-proxy
 	// It has to be in [0.1,100]
 	QueueSideCarResourcePercentageAnnotation = "queue.sidecar." + GroupName + "/resourcePercentage"
+
+	// VisibilityClusterLocal is the label value for VisibilityLabelKey
+	// that will result to the Route/KService getting a cluster local
+	// domain suffix.
+	VisibilityClusterLocal = "cluster-local"
+)
+
+var (
+	// ServicesResource represents a Knative Service
+	ServicesResource = schema.GroupResource{
+		Group:    GroupName,
+		Resource: "services",
+	}
+
+	// ConfigurationsResource represents a Knative Configuration
+	ConfigurationsResource = schema.GroupResource{
+		Group:    GroupName,
+		Resource: "configurations",
+	}
+
+	// RevisionsResource represents a Knative Revision
+	RevisionsResource = schema.GroupResource{
+		Group:    GroupName,
+		Resource: "revisions",
+	}
+
+	// RoutesResource represents a Knative Route
+	RoutesResource = schema.GroupResource{
+		Group:    GroupName,
+		Resource: "routes",
+	}
 )

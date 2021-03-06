@@ -17,34 +17,51 @@ limitations under the License.
 package statserver
 
 import (
-	"bytes"
-	"encoding/gob"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/gorilla/websocket"
+	"go.uber.org/goleak"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"knative.dev/serving/pkg/autoscaler"
+	network "knative.dev/networking/pkg"
+	"knative.dev/serving/pkg/autoscaler/metrics"
 
 	"k8s.io/apimachinery/pkg/types"
 )
 
+var (
+	msg1 = metrics.StatMessage{
+		Key: types.NamespacedName{Namespace: "test-namespace", Name: "test-revision"},
+		Stat: metrics.Stat{
+			PodName:                   "activator1",
+			AverageConcurrentRequests: 2.1,
+			RequestCount:              51,
+		},
+	}
+	msg2 = metrics.StatMessage{
+		Key: types.NamespacedName{Namespace: "test-namespace", Name: "test-revision2"},
+		Stat: metrics.Stat{
+			PodName:                   "activator2",
+			AverageConcurrentRequests: 2.2,
+			RequestCount:              30,
+		},
+	}
+	both = []metrics.StatMessage{msg1, msg2}
+)
+
 func TestServerLifecycle(t *testing.T) {
-	statsCh := make(chan autoscaler.StatMessage)
+	statsCh := make(chan metrics.StatMessage)
 	server := newTestServer(statsCh)
 
 	eg := errgroup.Group{}
-	eg.Go(func() error {
-		return server.listenAndServe()
-	})
+	eg.Go(server.listenAndServe)
 
 	server.listenAddr()
 	server.Shutdown(time.Second)
@@ -55,16 +72,16 @@ func TestServerLifecycle(t *testing.T) {
 }
 
 func TestProbe(t *testing.T) {
-	statsCh := make(chan autoscaler.StatMessage)
+	statsCh := make(chan metrics.StatMessage)
 	server := newTestServer(statsCh)
 
 	defer server.Shutdown(0)
 	go server.listenAndServe()
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/healthz", server.listenAddr()), nil)
+	req, err := http.NewRequest(http.MethodGet, server.listenAddr()+network.ProbePath, nil)
 	if err != nil {
 		t.Fatal("Error creating request:", err)
 	}
-	req.Header.Set("User-Agent", "kube-probe/1.15.i.wish")
+	req.Header.Set(network.UserAgentKey, network.KubeProbeUAPrefix+"1.15.i.wish")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -77,41 +94,42 @@ func TestProbe(t *testing.T) {
 }
 
 func TestStatsReceived(t *testing.T) {
-	statsCh := make(chan autoscaler.StatMessage)
+	statsCh := make(chan metrics.StatMessage)
 	server := newTestServer(statsCh)
 
 	defer server.Shutdown(0)
 	go server.listenAndServe()
 
-	statSink := dialOK(server.listenAddr(), t)
+	statSink := dialOK(t, server.listenAddr())
 
-	assertReceivedOK(newStatMessage(types.NamespacedName{Namespace: "test-namespace", Name: "test-revision"}, "activator1", 2.1, 51), statSink, statsCh, t)
-	assertReceivedOK(newStatMessage(types.NamespacedName{Namespace: "test-namespace", Name: "test-revision2"}, "activator2", 2.2, 30), statSink, statsCh, t)
+	// protobuf
+	assertReceivedProto(t, both, statSink, statsCh)
 
-	closeSink(statSink, t)
+	closeSink(t, statSink)
 }
 
 func TestServerShutdown(t *testing.T) {
-	statsCh := make(chan autoscaler.StatMessage)
+	statsCh := make(chan metrics.StatMessage)
 	server := newTestServer(statsCh)
 
 	go server.listenAndServe()
 
 	listenAddr := server.listenAddr()
-	statSink := dialOK(listenAddr, t)
+	statSink := dialOK(t, listenAddr)
 
-	assertReceivedOK(newStatMessage(types.NamespacedName{Namespace: "test-namespace", Name: "test-revision"}, "activator1", 2.1, 51), statSink, statsCh, t)
+	assertReceivedProto(t, both, statSink, statsCh)
 
 	server.Shutdown(time.Second)
 	// We own the channel.
 	close(statsCh)
 
 	// Send a statistic to the server
-	send(statSink, newStatMessage(types.NamespacedName{Namespace: "test-namespace", Name: "test-revision2"}, "activator2", 2.2, 30), t)
+	if err := sendProto(statSink, both); err != nil {
+		t.Fatal("Expected send to succeed, got:", err)
+	}
 
 	// Check the statistic was not received
-	_, ok := <-statsCh
-	if ok {
+	if _, ok := <-statsCh; ok {
 		t.Fatal("Received statistic after shutdown")
 	}
 
@@ -119,92 +137,149 @@ func TestServerShutdown(t *testing.T) {
 	if _, _, err := statSink.NextReader(); err == nil {
 		t.Fatal("Connection not closed")
 	} else {
-		err, ok := err.(*websocket.CloseError)
-		if !ok {
+		var errClose *websocket.CloseError
+		if !errors.As(err, &errClose) {
 			t.Fatal("CloseError not received")
 		}
-		if err.Code != 1012 {
-			t.Fatalf("CloseError with unexpected close code %d received", err.Code)
+		if errClose.Code != 1012 {
+			t.Fatalf("CloseError with unexpected close code %d received", errClose.Code)
 		}
 	}
 
 	// Check that new connections are refused with some error
-	if _, err := dial(listenAddr, t); err == nil {
+	if _, err := dial(listenAddr); err == nil {
 		t.Fatal("Connection not refused")
 	}
 
-	closeSink(statSink, t)
+	closeSink(t, statSink)
 }
 
 func TestServerDoesNotLeakGoroutines(t *testing.T) {
-	statsCh := make(chan autoscaler.StatMessage)
+	statsCh := make(chan metrics.StatMessage)
 	server := newTestServer(statsCh)
+	defer server.Shutdown(0)
 
 	go server.listenAndServe()
 
-	originalGoroutines := runtime.NumGoroutine()
+	// Check the number of goroutines eventually reduces to the number there were before the connection was created
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
 	listenAddr := server.listenAddr()
-	statSink := dialOK(listenAddr, t)
+	statSink := dialOK(t, listenAddr)
 
-	assertReceivedOK(newStatMessage(types.NamespacedName{Namespace: "test-namespace", Name: "test-revision"}, "activator1", 2.1, 51), statSink, statsCh, t)
+	assertReceivedProto(t, both, statSink, statsCh)
 
-	closeSink(statSink, t)
+	closeSink(t, statSink)
+}
 
-	// Check the number of goroutines eventually reduces to the number there were before the connection was created
-	for i := 1000; i >= 0; i-- {
-		currentGoRoutines := runtime.NumGoroutine()
-		if currentGoRoutines <= originalGoroutines {
-			break
+func TestServerNotBucketHost(t *testing.T) {
+	statsCh := make(chan metrics.StatMessage)
+	server := newTestServerWithOwnerFunc(statsCh, alwaysFalse)
+	defer server.Shutdown(0)
+
+	go server.listenAndServe()
+
+	// Verify the server behaves normally when the host is not a bucket host.
+	statSink := dialOK(t, server.listenAddr())
+	assertReceivedProto(t, both, statSink, statsCh)
+	closeSink(t, statSink)
+}
+
+func TestServerOwnerForBucketHost(t *testing.T) {
+	// Override the function to mock a bucket host.
+	isBucketHost = alwaysTrue
+
+	statsCh := make(chan metrics.StatMessage)
+	server := newTestServerWithOwnerFunc(statsCh, alwaysTrue)
+	defer server.Shutdown(0)
+
+	go server.listenAndServe()
+
+	// Verify the server behaves normally when the host is a bucket host
+	// and the pod is the owner of the bucket.
+	statSink := dialOK(t, server.listenAddr())
+	assertReceivedProto(t, both, statSink, statsCh)
+	closeSink(t, statSink)
+}
+
+func TestServerNotOwnerForBucketHost(t *testing.T) {
+	// Override the function to mock a bucket host.
+	isBucketHost = alwaysTrue
+
+	statsCh := make(chan metrics.StatMessage)
+	server := newTestServerWithOwnerFunc(statsCh, alwaysFalse)
+	defer server.Shutdown(0)
+
+	go server.listenAndServe()
+
+	if _, err := dial(server.listenAddr()); err == nil {
+		t.Error("Want an error from Dial but got none")
+	}
+}
+
+func BenchmarkStatServer(b *testing.B) {
+	statsCh := make(chan metrics.StatMessage, 100)
+	server := newTestServer(statsCh)
+	go server.listenAndServe()
+	defer server.Shutdown(time.Second)
+
+	statSink, err := dial(server.listenAddr())
+	if err != nil {
+		b.Fatal("Dial failed:", err)
+	}
+
+	// The activator sends a bunch of metrics at once usually. This simulates cases with
+	// the respective number of active revisions, sending via the activator.
+	for _, size := range []int{1, 2, 5, 10, 20, 50, 100} {
+		msgs := make([]metrics.StatMessage, 0, size)
+		for i := 0; i < size; i++ {
+			msgs = append(msgs, msg1)
 		}
-		time.Sleep(5 * time.Millisecond)
-		if i == 0 {
-			t.Fatalf("Current number of goroutines %d is not equal to the original number %d", currentGoRoutines, originalGoroutines)
-		}
-	}
 
-	server.Shutdown(time.Second)
-}
+		b.Run(fmt.Sprintf("proto-encoding-%d-msgs", len(msgs)), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if err := sendProto(statSink, msgs); err != nil {
+					b.Fatal("Expected send to succeed, but got:", err)
+				}
 
-func newStatMessage(revKey types.NamespacedName, podName string, averageConcurrentRequests float64, requestCount float64) autoscaler.StatMessage {
-	return autoscaler.StatMessage{
-		Key: revKey,
-		Stat: autoscaler.Stat{
-			PodName:                   podName,
-			AverageConcurrentRequests: averageConcurrentRequests,
-			RequestCount:              requestCount,
-		},
+				for range msgs {
+					<-statsCh
+				}
+			}
+		})
 	}
 }
 
-func assertReceivedOK(sm autoscaler.StatMessage, statSink *websocket.Conn, statsCh <-chan autoscaler.StatMessage, t *testing.T) bool {
-	send(statSink, sm, t)
-	recv, ok := <-statsCh
-	if !ok {
-		t.Fatalf("statistic not received")
+func assertReceivedProto(t *testing.T, sms []metrics.StatMessage, statSink *websocket.Conn, statsCh <-chan metrics.StatMessage) {
+	t.Helper()
+
+	if err := sendProto(statSink, sms); err != nil {
+		t.Fatal("Expected send to succeed, got:", err)
 	}
-	if recv.Stat.Time == (time.Time{}) {
-		t.Fatalf("Stat time is nil")
+
+	got := make([]metrics.StatMessage, 0, len(sms))
+	for range sms {
+		got = append(got, <-statsCh)
 	}
-	ignoreTimeField := cmpopts.IgnoreFields(autoscaler.StatMessage{}, "Stat.Time")
-	if !cmp.Equal(sm, recv, ignoreTimeField) {
-		t.Fatalf("StatMessage mismatch: diff (-got, +want) %s", cmp.Diff(recv, sm, ignoreTimeField))
+	if !cmp.Equal(sms, got) {
+		t.Fatal("StatMessage mismatch: diff (-got, +want)", cmp.Diff(got, sms))
 	}
-	return true
 }
 
-func dialOK(serverURL string, t *testing.T) *websocket.Conn {
-	statSink, err := dial(serverURL, t)
+func dialOK(t *testing.T, serverURL string) *websocket.Conn {
+	t.Helper()
+
+	statSink, err := dial(serverURL)
 	if err != nil {
 		t.Fatal("Dial failed:", err)
 	}
 	return statSink
 }
 
-func dial(serverURL string, t *testing.T) (*websocket.Conn, error) {
+func dial(serverURL string) (*websocket.Conn, error) {
 	u, err := url.Parse(serverURL)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	u.Scheme = "ws"
 
@@ -215,19 +290,23 @@ func dial(serverURL string, t *testing.T) (*websocket.Conn, error) {
 	return statSink, err
 }
 
-func send(statSink *websocket.Conn, sm autoscaler.StatMessage, t *testing.T) {
-	var b bytes.Buffer
-	enc := gob.NewEncoder(&b)
+func sendProto(statSink *websocket.Conn, sms []metrics.StatMessage) error {
+	wsms := metrics.ToWireStatMessages(sms)
+	msg, err := wsms.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal StatMessage: %w", err)
+	}
 
-	if err := enc.Encode(sm); err != nil {
-		t.Fatal("Failed to encode data from stats channel:", err)
+	if err := statSink.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+		return fmt.Errorf("failed to write to stat sink: %w", err)
 	}
-	if err := statSink.WriteMessage(websocket.BinaryMessage, b.Bytes()); err != nil {
-		t.Fatal("Failed to write to stat sink:", err)
-	}
+
+	return nil
 }
 
-func closeSink(statSink *websocket.Conn, t *testing.T) {
+func closeSink(t *testing.T, statSink *websocket.Conn) {
+	t.Helper()
+
 	if err := statSink.Close(); err != nil {
 		t.Fatal("Failed to close", err)
 	}
@@ -240,9 +319,13 @@ type testServer struct {
 	listenAddrCh chan string
 }
 
-func newTestServer(statsCh chan<- autoscaler.StatMessage) *testServer {
+func newTestServer(statsCh chan<- metrics.StatMessage) *testServer {
+	return newTestServerWithOwnerFunc(statsCh, nil)
+}
+
+func newTestServerWithOwnerFunc(statsCh chan<- metrics.StatMessage, f func(bkt string) bool) *testServer {
 	return &testServer{
-		Server:       New(testAddress, statsCh, zap.NewNop().Sugar()),
+		Server:       New(testAddress, statsCh, zap.NewNop().Sugar(), f),
 		listenAddrCh: make(chan string, 1),
 	}
 }
@@ -268,4 +351,12 @@ type testListener struct {
 func (t *testListener) Accept() (net.Conn, error) {
 	t.listenAddr <- "http://" + t.Listener.Addr().String()
 	return t.Listener.Accept()
+}
+
+func alwaysTrue(_ string) bool {
+	return true
+}
+
+func alwaysFalse(_ string) bool {
+	return false
 }

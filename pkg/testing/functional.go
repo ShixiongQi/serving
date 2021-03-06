@@ -22,108 +22,126 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"knative.dev/networking/pkg/apis/networking"
+	netv1alpha1 "knative.dev/networking/pkg/apis/networking/v1alpha1"
 	"knative.dev/pkg/kmeta"
 	"knative.dev/serving/pkg/apis/autoscaling"
-	asv1a1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
-	"knative.dev/serving/pkg/apis/networking"
-	netv1alpha1 "knative.dev/serving/pkg/apis/networking/v1alpha1"
+	autoscalingv1alpha1 "knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
 )
 
 // PodAutoscalerOption is an option that can be applied to a PA.
-type PodAutoscalerOption func(*asv1a1.PodAutoscaler)
+type PodAutoscalerOption func(*autoscalingv1alpha1.PodAutoscaler)
 
 // WithProtocolType sets the protocol type on the PodAutoscaler.
 func WithProtocolType(pt networking.ProtocolType) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Spec.ProtocolType = pt
 	}
 }
 
-// WithReachability sets the reachability of the PodAutoscaler to the given value
-func WithReachability(r asv1a1.ReachabilityType) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+// WithReachability sets the reachability of the PodAutoscaler to the given value.
+func WithReachability(r autoscalingv1alpha1.ReachabilityType) PodAutoscalerOption {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Spec.Reachability = r
 	}
 }
 
-// WithReachabilityUnknown sets the reachability of the PodAutoscaler to unknown
-func WithReachabilityUnknown(pa *asv1a1.PodAutoscaler) {
-	WithReachability(asv1a1.ReachabilityUnknown)(pa)
+// WithReachabilityUnknown sets the reachability of the PodAutoscaler to unknown.
+func WithReachabilityUnknown(pa *autoscalingv1alpha1.PodAutoscaler) {
+	WithReachability(autoscalingv1alpha1.ReachabilityUnknown)(pa)
 }
 
-// WithReachabilityReachable sets the reachability of the PodAutoscaler to reachable
-func WithReachabilityReachable(pa *asv1a1.PodAutoscaler) {
-	WithReachability(asv1a1.ReachabilityReachable)(pa)
+// WithReachabilityReachable sets the reachability of the PodAutoscaler to reachable.
+func WithReachabilityReachable(pa *autoscalingv1alpha1.PodAutoscaler) {
+	WithReachability(autoscalingv1alpha1.ReachabilityReachable)(pa)
 }
 
-// WithReachabilityUnreachable sets the reachability of the PodAutoscaler to unreachable
-func WithReachabilityUnreachable(pa *asv1a1.PodAutoscaler) {
-	WithReachability(asv1a1.ReachabilityUnreachable)(pa)
+// WithReachabilityUnreachable sets the reachability of the PodAutoscaler to unreachable.
+func WithReachabilityUnreachable(pa *autoscalingv1alpha1.PodAutoscaler) {
+	WithReachability(autoscalingv1alpha1.ReachabilityUnreachable)(pa)
 }
 
 // WithPAOwnersRemoved clears the owner references of this PA resource.
-func WithPAOwnersRemoved(pa *asv1a1.PodAutoscaler) {
+func WithPAOwnersRemoved(pa *autoscalingv1alpha1.PodAutoscaler) {
 	pa.OwnerReferences = nil
 }
 
-// MarkResourceNotOwnedByPA marks PA when it's now owning a resources it is supposed to own.
+// MarkResourceNotOwnedByPA marks PA as not owning a resource it is supposed to own.
 func MarkResourceNotOwnedByPA(rType, name string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Status.MarkResourceNotOwned(rType, name)
 	}
 }
 
 // WithPodAutoscalerOwnersRemoved clears the owner references of this PodAutoscaler.
-func WithPodAutoscalerOwnersRemoved(r *asv1a1.PodAutoscaler) {
+func WithPodAutoscalerOwnersRemoved(r *autoscalingv1alpha1.PodAutoscaler) {
 	r.OwnerReferences = nil
 }
 
 // WithTraffic updates the PA to reflect it receiving traffic.
-func WithTraffic(pa *asv1a1.PodAutoscaler) {
+func WithTraffic(pa *autoscalingv1alpha1.PodAutoscaler) {
 	pa.Status.MarkActive()
+}
+
+// WithPASKSReady marks PA status that SKS is ready.
+func WithPASKSReady(pa *autoscalingv1alpha1.PodAutoscaler) {
+	pa.Status.MarkSKSReady()
+}
+
+// WithPASKSNotReady marks PA status that SKS is not ready.
+func WithPASKSNotReady(m string) PodAutoscalerOption {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
+		pa.Status.MarkSKSNotReady(m)
+	}
+}
+
+// WithScaleTargetInitialized updates the PA to reflect it having initialized its
+// ScaleTarget.
+func WithScaleTargetInitialized(pa *autoscalingv1alpha1.PodAutoscaler) {
+	pa.Status.MarkScaleTargetInitialized()
 }
 
 // WithPAStatusService annotates PA Status with the provided service name.
 func WithPAStatusService(svc string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Status.ServiceName = svc
 	}
 }
 
 // WithPAMetricsService annotates PA Status with the provided service name.
 func WithPAMetricsService(svc string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Status.MetricsServiceName = svc
 	}
 }
 
 // WithBufferedTraffic updates the PA to reflect that it has received
 // and buffered traffic while it is being activated.
-func WithBufferedTraffic(reason, message string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
-		pa.Status.MarkActivating(reason, message)
-	}
+func WithBufferedTraffic(pa *autoscalingv1alpha1.PodAutoscaler) {
+	pa.Status.MarkActivating("Queued",
+		"Requests to the target are being buffered as resources are provisioned.")
 }
 
 // WithNoTraffic updates the PA to reflect the fact that it is not
 // receiving traffic.
 func WithNoTraffic(reason, message string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Status.MarkInactive(reason, message)
 	}
 }
 
 // WithPADeletionTimestamp will set the DeletionTimestamp on the PodAutoscaler.
-func WithPADeletionTimestamp(r *asv1a1.PodAutoscaler) {
+func WithPADeletionTimestamp(r *autoscalingv1alpha1.PodAutoscaler) {
 	t := metav1.NewTime(time.Unix(1e9, 0))
 	r.ObjectMeta.SetDeletionTimestamp(&t)
 }
 
 // WithHPAClass updates the PA to add the hpa class annotation.
-func WithHPAClass(pa *asv1a1.PodAutoscaler) {
+func WithHPAClass(pa *autoscalingv1alpha1.PodAutoscaler) {
 	if pa.Annotations == nil {
-		pa.Annotations = make(map[string]string)
+		pa.Annotations = make(map[string]string, 1)
 	}
 	pa.Annotations[autoscaling.ClassAnnotationKey] = autoscaling.HPA
 }
@@ -131,15 +149,15 @@ func WithHPAClass(pa *asv1a1.PodAutoscaler) {
 // WithPAContainerConcurrency returns a PodAutoscalerOption which sets
 // the PodAutoscaler containerConcurrency to the provided value.
 func WithPAContainerConcurrency(cc int64) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		pa.Spec.ContainerConcurrency = cc
 	}
 }
 
 func withAnnotationValue(key, value string) PodAutoscalerOption {
-	return func(pa *asv1a1.PodAutoscaler) {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
 		if pa.Annotations == nil {
-			pa.Annotations = make(map[string]string)
+			pa.Annotations = make(map[string]string, 1)
 		}
 		pa.Annotations[key] = value
 	}
@@ -168,7 +186,7 @@ func WithWindowAnnotation(window string) PodAutoscalerOption {
 
 // WithPanicThresholdPercentageAnnotation returns a PodAutoscalerOption
 // which sets the PodAutoscaler
-// autoscaling.knative.dev/targetPanicPercentage annotation to the
+// autoscaling.knative.dev/panicThresholdPercentage annotation to the
 // provided value.
 func WithPanicThresholdPercentageAnnotation(percentage string) PodAutoscalerOption {
 	return withAnnotationValue(autoscaling.PanicThresholdPercentageAnnotationKey, percentage)
@@ -176,7 +194,7 @@ func WithPanicThresholdPercentageAnnotation(percentage string) PodAutoscalerOpti
 
 // WithPanicWindowPercentageAnnotation retturn a PodAutoscalerOption
 // which set the PodAutoscaler
-// autoscaling.knative.dev/windowPanicPercentage annotation to the
+// autoscaling.knative.dev/panicWindowPercentage annotation to the
 // provided value.
 func WithPanicWindowPercentageAnnotation(percentage string) PodAutoscalerOption {
 	return withAnnotationValue(autoscaling.PanicWindowPercentageAnnotationKey, percentage)
@@ -187,8 +205,16 @@ func WithMetricAnnotation(metric string) PodAutoscalerOption {
 	return withAnnotationValue(autoscaling.MetricAnnotationKey, metric)
 }
 
+// WithObservedGeneration returns a PodAutoScalerOption which sets
+// the Status.ObservedGeneration field to the given generation.
+func WithObservedGeneration(gen int64) PodAutoscalerOption {
+	return func(pa *autoscalingv1alpha1.PodAutoscaler) {
+		pa.Status.ObservedGeneration = gen
+	}
+}
+
 // WithMetricOwnersRemoved clears the owner references of this PodAutoscaler.
-func WithMetricOwnersRemoved(m *asv1a1.Metric) {
+func WithMetricOwnersRemoved(m *autoscalingv1alpha1.Metric) {
 	m.OwnerReferences = nil
 }
 
@@ -212,15 +238,6 @@ func OverrideServiceName(name string) K8sServiceOption {
 	}
 }
 
-func SvcWithAnnotationValue(key, value string) K8sServiceOption {
-	return func(svc *corev1.Service) {
-		if svc.Annotations == nil {
-			svc.Annotations = make(map[string]string)
-		}
-		svc.Annotations[key] = value
-	}
-}
-
 // MutateK8sService changes the service in a way that must be reconciled.
 func MutateK8sService(svc *corev1.Service) {
 	// An effective hammer ;-P
@@ -238,6 +255,11 @@ func WithClusterIP(ip string) K8sServiceOption {
 func WithExternalName(name string) K8sServiceOption {
 	return func(svc *corev1.Service) {
 		svc.Spec.ExternalName = name
+		svc.Spec.Ports = []corev1.ServicePort{{
+			Name:       networking.ServicePortNameH2C,
+			Port:       int32(80),
+			TargetPort: intstr.FromInt(80),
+		}}
 	}
 }
 
@@ -246,17 +268,10 @@ func WithK8sSvcOwnersRemoved(svc *corev1.Service) {
 	svc.OwnerReferences = nil
 }
 
-// WithSvcSelector sets the selector of the service.
-func WithSvcSelector(sel map[string]string) K8sServiceOption {
-	return func(s *corev1.Service) {
-		s.Spec.Selector = sel
-	}
-}
-
 // EndpointsOption enables further configuration of the Kubernetes Endpoints.
 type EndpointsOption func(*corev1.Endpoints)
 
-// WithSubsets adds subsets to the body of a Revision, enabling us to refer readiness.
+// WithSubsets adds subsets to the body of an Endpoints object.
 func WithSubsets(ep *corev1.Endpoints) {
 	ep.Subsets = []corev1.EndpointSubset{{
 		Addresses: []corev1.EndpointAddress{{IP: "127.0.0.1"}},
@@ -288,7 +303,7 @@ func WithFailingContainer(name string, exitCode int, message string) PodOption {
 	}
 }
 
-// WithUnschedulableContainer sets the .Status.Conditionss on the pod to
+// WithUnschedulableContainer sets the .Status.Conditions on the pod to
 // include `PodScheduled` status to `False` with the given message and reason.
 func WithUnschedulableContainer(reason, message string) PodOption {
 	return func(pod *corev1.Pod) {
@@ -317,13 +332,21 @@ func WithWaitingContainer(name, reason, message string) PodOption {
 	}
 }
 
-// IngressOption enables further configuration of the IngressAccessor.
-type IngressOption func(netv1alpha1.IngressAccessor)
+// IngressOption enables further configuration of the Ingress.
+type IngressOption func(*netv1alpha1.Ingress)
 
 // WithHosts sets the Hosts of the ingress rule specified index
 func WithHosts(index int, hosts ...string) IngressOption {
-	return func(ingress netv1alpha1.IngressAccessor) {
-		ingress.GetSpec().Rules[index].Hosts = hosts
+	return func(ingress *netv1alpha1.Ingress) {
+		ingress.Spec.Rules[index].Hosts = hosts
+	}
+}
+
+// WithLoadbalancerFailed marks the respective status as failed using
+// the given reason and message.
+func WithLoadbalancerFailed(reason, message string) IngressOption {
+	return func(ingress *netv1alpha1.Ingress) {
+		ingress.Status.MarkLoadBalancerFailed(reason, message)
 	}
 }
 
@@ -335,7 +358,7 @@ func WithPubService(sks *netv1alpha1.ServerlessService) {
 	sks.Status.ServiceName = sks.Name
 }
 
-// WithDeployRef annotates SKS with a deployment objectRef
+// WithDeployRef annotates SKS with a deployment objectRef.
 func WithDeployRef(name string) SKSOption {
 	return func(sks *netv1alpha1.ServerlessService) {
 		sks.Spec.ObjectRef = corev1.ObjectReference{
@@ -351,6 +374,14 @@ func WithSKSReady(sks *netv1alpha1.ServerlessService) {
 	WithPrivateService(sks)
 	WithPubService(sks)
 	sks.Status.MarkEndpointsReady()
+}
+
+// WithNumActivators sets the number of requested activators
+// on the SKS spec.
+func WithNumActivators(n int32) SKSOption {
+	return func(sks *netv1alpha1.ServerlessService) {
+		sks.Spec.NumActivators = n
+	}
 }
 
 // WithPrivateService annotates SKS status with the private service name.

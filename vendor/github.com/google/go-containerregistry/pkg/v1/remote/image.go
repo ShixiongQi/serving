@@ -21,13 +21,19 @@ import (
 	"net/url"
 	"sync"
 
+	"github.com/google/go-containerregistry/pkg/internal/redact"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/internal/verify"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/google/go-containerregistry/pkg/v1/v1util"
 )
+
+var acceptableImageMediaTypes = []types.MediaType{
+	types.DockerManifestSchema2,
+	types.OCIManifestSchema1,
+}
 
 // remoteImage accesses an image from a remote registry
 type remoteImage struct {
@@ -37,21 +43,14 @@ type remoteImage struct {
 	configLock   sync.Mutex // Protects config
 	config       []byte
 	mediaType    types.MediaType
+	descriptor   *v1.Descriptor
 }
 
 var _ partial.CompressedImageCore = (*remoteImage)(nil)
 
 // Image provides access to a remote image reference.
 func Image(ref name.Reference, options ...Option) (v1.Image, error) {
-	acceptable := []types.MediaType{
-		types.DockerManifestSchema2,
-		types.OCIManifestSchema1,
-		// We resolve these to images later.
-		types.DockerManifestList,
-		types.OCIImageIndex,
-	}
-
-	desc, err := get(ref, acceptable, options...)
+	desc, err := Get(ref, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -76,15 +75,14 @@ func (r *remoteImage) RawManifest() ([]byte, error) {
 	// NOTE(jonjohnsonjr): We should never get here because the public entrypoints
 	// do type-checking via remote.Descriptor. I've left this here for tests that
 	// directly instantiate a remoteImage.
-	acceptable := []types.MediaType{
-		types.DockerManifestSchema2,
-		types.OCIManifestSchema1,
-	}
-	manifest, desc, err := r.fetchManifest(r.Ref, acceptable)
+	manifest, desc, err := r.fetchManifest(r.Ref, acceptableImageMediaTypes)
 	if err != nil {
 		return nil, err
 	}
 
+	if r.descriptor == nil {
+		r.descriptor = desc
+	}
 	r.mediaType = desc.MediaType
 	r.manifest = manifest
 	return r.manifest, nil
@@ -102,7 +100,7 @@ func (r *remoteImage) RawConfigFile() ([]byte, error) {
 		return nil, err
 	}
 
-	body, err := r.fetchBlob(m.Config.Digest)
+	body, err := r.fetchBlob(r.context, m.Config.Digest)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +111,15 @@ func (r *remoteImage) RawConfigFile() ([]byte, error) {
 		return nil, err
 	}
 	return r.config, nil
+}
+
+// Descriptor retains the original descriptor from an index manifest.
+// See partial.Descriptor.
+func (r *remoteImage) Descriptor() (*v1.Descriptor, error) {
+	// kind of a hack, but RawManifest does appropriate locking/memoization
+	// and makes sure r.descriptor is populated.
+	_, err := r.RawManifest()
+	return r.descriptor, err
 }
 
 // remoteImageLayer implements partial.CompressedLayer
@@ -136,6 +143,9 @@ func (rl *remoteImageLayer) Compressed() (io.ReadCloser, error) {
 		return nil, err
 	}
 
+	// We don't want to log binary layers -- this can break terminals.
+	ctx := redact.NewContext(rl.ri.context, "omitting binary blobs from logs")
+
 	for _, s := range d.URLs {
 		u, err := url.Parse(s)
 		if err != nil {
@@ -150,7 +160,12 @@ func (rl *remoteImageLayer) Compressed() (io.ReadCloser, error) {
 	// TODO: Maybe we don't want to try pulling from the registry first?
 	var lastErr error
 	for _, u := range urls {
-		resp, err := rl.ri.Client.Get(u.String())
+		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := rl.ri.Client.Do(req.WithContext(ctx))
 		if err != nil {
 			lastErr = err
 			continue
@@ -162,7 +177,7 @@ func (rl *remoteImageLayer) Compressed() (io.ReadCloser, error) {
 			continue
 		}
 
-		return v1util.VerifyReadCloser(resp.Body, rl.digest)
+		return verify.ReadCloser(resp.Body, rl.digest)
 	}
 
 	return nil, lastErr
@@ -198,6 +213,12 @@ func (rl *remoteImageLayer) ConfigFile() (*v1.ConfigFile, error) {
 // available in our ConfigFile.
 func (rl *remoteImageLayer) DiffID() (v1.Hash, error) {
 	return partial.BlobToDiffID(rl, rl.digest)
+}
+
+// Descriptor retains the original descriptor from an image manifest.
+// See partial.Descriptor.
+func (rl *remoteImageLayer) Descriptor() (*v1.Descriptor, error) {
+	return partial.BlobDescriptor(rl, rl.digest)
 }
 
 // LayerByDigest implements partial.CompressedLayer

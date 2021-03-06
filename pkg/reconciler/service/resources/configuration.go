@@ -17,33 +17,50 @@ limitations under the License.
 package resources
 
 import (
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"knative.dev/pkg/kmeta"
 	"knative.dev/serving/pkg/apis/serving"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	"knative.dev/serving/pkg/reconciler/labeler"
 	"knative.dev/serving/pkg/reconciler/service/resources/names"
-	"knative.dev/serving/pkg/resources"
 )
 
 // MakeConfiguration creates a Configuration from a Service object.
-func MakeConfiguration(service *v1alpha1.Service) (*v1alpha1.Configuration, error) {
-	return &v1alpha1.Configuration{
+func MakeConfiguration(service *v1.Service) *v1.Configuration {
+	return MakeConfigurationFromExisting(service, &v1.Configuration{})
+}
+
+// MakeConfigurationFromExisting creates a Configuration from a Service object given an existing Configuration.
+func MakeConfigurationFromExisting(service *v1.Service, existing *v1.Configuration) *v1.Configuration {
+	labels := map[string]string{
+		serving.ServiceLabelKey:    service.Name,
+		serving.ServiceUIDLabelKey: string(service.ObjectMeta.UID),
+	}
+	anns := kmeta.FilterMap(service.GetAnnotations(), func(key string) bool {
+		return key == corev1.LastAppliedConfigAnnotation ||
+			// Configs & Revisions don't use rollout information, it is only for routes.
+			key == serving.RolloutDurationKey
+	})
+
+	routeName := names.Route(service)
+	set := labeler.GetListAnnValue(existing.Annotations, serving.RoutesAnnotationKey)
+	set.Insert(routeName)
+	anns[serving.RoutesAnnotationKey] = strings.Join(set.UnsortedList(), ",")
+
+	return &v1.Configuration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      names.Configuration(service),
 			Namespace: service.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				*kmeta.NewControllerRef(service),
 			},
-			Labels: resources.UnionMaps(service.GetLabels(), map[string]string{
-				serving.RouteLabelKey:   names.Route(service),
-				serving.ServiceLabelKey: service.Name,
-			}),
-			Annotations: resources.FilterMap(service.GetAnnotations(), func(key string) bool {
-				return key == corev1.LastAppliedConfigAnnotation
-			}),
+			Labels:      kmeta.UnionMaps(service.GetLabels(), labels),
+			Annotations: anns,
 		},
 		Spec: service.Spec.ConfigurationSpec,
-	}, nil
+	}
 }

@@ -1,5 +1,6 @@
 /*
 Copyright 2018 The Knative Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -16,20 +17,22 @@ limitations under the License.
 package handler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"go.opencensus.io/plugin/ochttp"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"knative.dev/pkg/controller"
+	corev1 "k8s.io/api/core/v1"
+	network "knative.dev/networking/pkg"
+	pkgnet "knative.dev/pkg/network"
 	"knative.dev/pkg/ptr"
 	rtesting "knative.dev/pkg/reconciler/testing"
 	"knative.dev/pkg/tracing"
@@ -37,15 +40,10 @@ import (
 	tracetesting "knative.dev/pkg/tracing/testing"
 	"knative.dev/serving/pkg/activator"
 	activatorconfig "knative.dev/serving/pkg/activator/config"
-	anet "knative.dev/serving/pkg/activator/net"
 	activatortest "knative.dev/serving/pkg/activator/testing"
 	"knative.dev/serving/pkg/apis/serving"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
-	servingv1informers "knative.dev/serving/pkg/client/informers/externalversions/serving/v1alpha1"
-	fakeservingclient "knative.dev/serving/pkg/client/injection/client/fake"
-	fakerevisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision/fake"
-	"knative.dev/serving/pkg/network"
+	"knative.dev/serving/pkg/queue"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,7 +63,7 @@ type fakeThrottler struct {
 	err error
 }
 
-func (ft fakeThrottler) Try(ctx context.Context, _ types.NamespacedName, f func(string) error) error {
+func (ft fakeThrottler) Try(_ context.Context, _ types.NamespacedName, f func(string) error) error {
 	if ft.err != nil {
 		return ft.err
 	}
@@ -74,83 +72,38 @@ func (ft fakeThrottler) Try(ctx context.Context, _ types.NamespacedName, f func(
 
 func TestActivationHandler(t *testing.T) {
 	tests := []struct {
-		label         string
-		namespace     string
-		name          string
-		wantBody      string
-		wantCode      int
-		wantErr       error
-		probeErr      error
-		probeCode     int
-		probeResp     []string
-		throttler     Throttler
-		reporterCalls []reporterCall
+		name      string
+		wantBody  string
+		wantCode  int
+		wantErr   error
+		probeErr  error
+		probeCode int
+		probeResp []string
+		throttler Throttler
 	}{{
-		label:     "active endpoint",
-		namespace: testNamespace,
-		name:      testRevName,
+		name:      "active endpoint",
 		wantBody:  wantBody,
 		wantCode:  http.StatusOK,
-		wantErr:   nil,
 		throttler: fakeThrottler{},
-		reporterCalls: []reporterCall{{
-			Op:         "ReportRequestCount",
-			Namespace:  testNamespace,
-			Revision:   testRevName,
-			Service:    "service-real-name",
-			Config:     "config-real-name",
-			StatusCode: http.StatusOK,
-			Attempts:   1,
-			Value:      1,
-		}},
 	}, {
-		label:         "unknown revision",
-		namespace:     "fake-namespace",
-		name:          "fake-name",
-		wantBody:      errMsg(`revision.serving.knative.dev "fake-name" not found`),
-		wantCode:      http.StatusNotFound,
-		wantErr:       nil,
-		throttler:     fakeThrottler{},
-		reporterCalls: nil,
-	}, {
-		label:     "request error",
-		namespace: testNamespace,
-		name:      testRevName,
+		name:      "request error",
 		wantBody:  "request error\n",
 		wantCode:  http.StatusBadGateway,
 		wantErr:   errors.New("request error"),
 		throttler: fakeThrottler{},
-		reporterCalls: []reporterCall{{
-			Op:         "ReportRequestCount",
-			Namespace:  testNamespace,
-			Revision:   testRevName,
-			Service:    "service-real-name",
-			Config:     "config-real-name",
-			StatusCode: http.StatusBadGateway,
-			Attempts:   1,
-			Value:      1,
-		}},
 	}, {
-		label:         "throttler timeout",
-		namespace:     testNamespace,
-		name:          testRevName,
-		wantBody:      context.DeadlineExceeded.Error() + "\n",
-		wantCode:      http.StatusServiceUnavailable,
-		wantErr:       nil,
-		throttler:     fakeThrottler{err: context.DeadlineExceeded},
-		reporterCalls: nil,
+		name:      "throttler timeout",
+		wantBody:  context.DeadlineExceeded.Error() + "\n",
+		wantCode:  http.StatusServiceUnavailable,
+		throttler: fakeThrottler{err: context.DeadlineExceeded},
 	}, {
-		label:         "overflow",
-		namespace:     testNamespace,
-		name:          testRevName,
-		wantBody:      "activator overload\n",
-		wantCode:      http.StatusServiceUnavailable,
-		wantErr:       nil,
-		throttler:     fakeThrottler{err: anet.ErrActivatorOverload},
-		reporterCalls: nil,
+		name:      "overflow",
+		wantBody:  "pending request queue full\n",
+		wantCode:  http.StatusServiceUnavailable,
+		throttler: fakeThrottler{err: queue.ErrRequestQueueFull},
 	}}
 	for _, test := range tests {
-		t.Run(test.label, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			probeResponses := make([]activatortest.FakeResponse, len(test.probeResp))
 			for i := 0; i < len(test.probeResp); i++ {
 				probeResponses[i] = activatortest.FakeResponse{
@@ -159,7 +112,7 @@ func TestActivationHandler(t *testing.T) {
 					Body: test.probeResp[i],
 				}
 			}
-			fakeRt := activatortest.FakeRoundTripper{
+			fakeRT := activatortest.FakeRoundTripper{
 				ExpectHost:     "test-host",
 				ProbeResponses: probeResponses,
 				RequestResponse: &activatortest.FakeResponse{
@@ -168,27 +121,20 @@ func TestActivationHandler(t *testing.T) {
 					Body: test.wantBody,
 				},
 			}
-			rt := network.RoundTripperFunc(fakeRt.RT)
-
-			reporter := &fakeReporter{}
+			rt := pkgnet.RoundTripperFunc(fakeRT.RT)
 
 			ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
 			defer cancel()
-			revisionInformer(ctx, revision(testNamespace, testRevName))
-			handler := (New(ctx, test.throttler, reporter)).(*activationHandler)
-
-			// Setup transports.
-			handler.transport = rt
+			handler := New(ctx, test.throttler, rt)
 
 			resp := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "http://example.com", nil)
-			req.Header.Set(activator.RevisionHeaderNamespace, test.namespace)
-			req.Header.Set(activator.RevisionHeaderName, test.name)
 			req.Host = "test-host"
 
 			// Set up config store to populate context.
 			configStore := setupConfigStore(t, logging.FromContext(ctx))
 			ctx = configStore.ToContext(ctx)
+			ctx = WithRevID(ctx, types.NamespacedName{Namespace: testNamespace, Name: testRevName})
 
 			handler.ServeHTTP(resp, req.WithContext(ctx))
 
@@ -198,25 +144,10 @@ func TestActivationHandler(t *testing.T) {
 
 			gotBody, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
-				t.Fatalf("Error reading body: %v", err)
+				t.Fatal("Error reading body:", err)
 			}
 			if string(gotBody) != test.wantBody {
-				t.Errorf("Unexpected response body. Response body %q, want %q", gotBody, test.wantBody)
-			}
-
-			// Filter out response time reporter calls
-			var gotCalls []reporterCall
-			if reporter.calls != nil {
-				gotCalls = make([]reporterCall, 0)
-				for _, gotCall := range reporter.calls {
-					if gotCall.Op != "ReportResponseTime" {
-						gotCalls = append(gotCalls, gotCall)
-					}
-				}
-			}
-
-			if diff := cmp.Diff(test.reporterCalls, gotCalls); diff != "" {
-				t.Errorf("Reporting calls are different (-want, +got) = %v", diff)
+				t.Errorf("Response body = %q, want: %q", gotBody, test.wantBody)
 			}
 		})
 	}
@@ -224,7 +155,7 @@ func TestActivationHandler(t *testing.T) {
 
 func TestActivationHandlerProxyHeader(t *testing.T) {
 	interceptCh := make(chan *http.Request, 1)
-	rt := network.RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+	rt := pkgnet.RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		interceptCh <- r
 		fake := httptest.NewRecorder()
 		return fake.Result(), nil
@@ -232,28 +163,26 @@ func TestActivationHandlerProxyHeader(t *testing.T) {
 
 	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
 	defer cancel()
-	revisionInformer(ctx, revision(testNamespace, testRevName))
 
-	handler := (New(ctx, fakeThrottler{}, &fakeReporter{})).(*activationHandler)
-	handler.transport = rt
+	handler := New(ctx, fakeThrottler{}, rt)
 
 	writer := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "http://example.com", nil)
-	req.Header.Set(activator.RevisionHeaderNamespace, testNamespace)
-	req.Header.Set(activator.RevisionHeaderName, testRevName)
 
-	// set up config store to populate context
+	// Set up config store to populate context.
 	configStore := setupConfigStore(t, logging.FromContext(ctx))
 	ctx = configStore.ToContext(req.Context())
+	ctx = WithRevID(ctx, types.NamespacedName{Namespace: testNamespace, Name: testRevName})
+
 	handler.ServeHTTP(writer, req.WithContext(ctx))
 
 	select {
 	case httpReq := <-interceptCh:
 		if got := httpReq.Header.Get(network.ProxyHeaderName); got != activator.Name {
-			t.Errorf("Header '%s' does not have the expected value. Want = '%s', got = '%s'.", network.ProxyHeaderName, activator.Name, got)
+			t.Errorf("Header %q = %q, want: %q", network.ProxyHeaderName, got, activator.Name)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timed out waiting for a request to be intercepted")
+	case <-time.After(1 * time.Second):
+		t.Error("Timed out waiting for a request to be intercepted")
 	}
 }
 
@@ -268,174 +197,95 @@ func TestActivationHandlerTraceSpans(t *testing.T) {
 		traceBackend: tracingconfig.Zipkin,
 	}, {
 		name:         "trace disabled",
-		wantSpans:    0,
 		traceBackend: tracingconfig.None,
 	}}
 
+	spanNames := []string{"throttler_try", "/", "activator_proxy"}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Setup transport
-			fakeRt := activatortest.FakeRoundTripper{
+			fakeRT := activatortest.FakeRoundTripper{
 				RequestResponse: &activatortest.FakeResponse{
-					Err:  nil,
 					Code: http.StatusOK,
 					Body: wantBody,
 				},
 			}
-			rt := network.RoundTripperFunc(fakeRt.RT)
+			rt := pkgnet.RoundTripperFunc(fakeRT.RT)
 
 			// Create tracer with reporter recorder
 			reporter, co := tracetesting.FakeZipkinExporter()
 			oct := tracing.NewOpenCensusTracer(co)
 
-			cfg := tracingconfig.Config{
-				Backend: tc.traceBackend,
-				Debug:   true,
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: tracingconfig.ConfigName,
+				},
+				Data: map[string]string{
+					"zipkin-endpoint": "localhost:1234",
+					"backend":         string(tc.traceBackend),
+					"debug":           "true",
+				},
 			}
-			if err := oct.ApplyConfig(&cfg); err != nil {
-				t.Errorf("Failed to apply tracer config: %v", err)
+			cfg, err := tracingconfig.NewTracingConfigFromConfigMap(cm)
+			if err != nil {
+				t.Fatal("Failed to generate config:", err)
+			}
+			if err := oct.ApplyConfig(cfg); err != nil {
+				t.Error("Failed to apply tracer config:", err)
 			}
 
 			ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(t)
-			revisions := revisionInformer(ctx, revision(testNamespace, testRevName))
-			waitInformers, err := controller.RunInformers(ctx.Done(), revisions.Informer())
-			if err != nil {
-				t.Fatalf("Failed to start informers: %v", err)
-			}
 			defer func() {
 				cancel()
 				reporter.Close()
 				oct.Finish()
-				waitInformers()
 			}()
 
-			handler := (New(ctx, fakeThrottler{}, &fakeReporter{})).(*activationHandler)
-			handler.transport = &ochttp.Transport{
-				Base: rt,
-			}
+			handler := New(ctx, fakeThrottler{}, rt)
 
 			// Set up config store to populate context.
 			configStore := setupConfigStore(t, logging.FromContext(ctx))
+			// Update the store with our "new" config explicitly.
+			configStore.OnConfigChanged(cm)
 			sendRequest(testNamespace, testRevName, handler, configStore)
 
 			gotSpans := reporter.Flush()
 			if len(gotSpans) != tc.wantSpans {
-				t.Errorf("Got %d spans, expected %d", len(gotSpans), tc.wantSpans)
+				t.Errorf("NumSpans = %d, want: %d", len(gotSpans), tc.wantSpans)
 			}
 
-			spanNames := []string{"throttler_try", "/", "proxy"}
 			for i, spanName := range spanNames[0:tc.wantSpans] {
 				if gotSpans[i].Name != spanName {
-					t.Errorf("Got span %d named %q, expected %q", i, gotSpans[i].Name, spanName)
+					t.Errorf("Span[%d] = %q, expected %q", i, gotSpans[i].Name, spanName)
 				}
 			}
 		})
 	}
 }
 
-func sendRequest(namespace, revName string, handler *activationHandler, store *activatorconfig.Store) *httptest.ResponseRecorder {
+func sendRequest(namespace, revName string, handler http.Handler, store *activatorconfig.Store) *httptest.ResponseRecorder {
 	resp := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "http://example.com", nil)
-	req.Header.Set(activator.RevisionHeaderNamespace, namespace)
-	req.Header.Set(activator.RevisionHeaderName, revName)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", nil)
 	ctx := store.ToContext(req.Context())
+	ctx = WithRevID(ctx, types.NamespacedName{Namespace: namespace, Name: revName})
 	handler.ServeHTTP(resp, req.WithContext(ctx))
 	return resp
 }
 
-type reporterCall struct {
-	Op         string
-	Namespace  string
-	Service    string
-	Config     string
-	Revision   string
-	StatusCode int
-	Attempts   int
-	Value      int64
-	Duration   time.Duration
-}
-
-type fakeReporter struct {
-	calls []reporterCall
-	mux   sync.Mutex
-}
-
-func (f *fakeReporter) ReportRequestConcurrency(ns, service, config, rev string, v int64) error {
-	f.mux.Lock()
-	defer f.mux.Unlock()
-	f.calls = append(f.calls, reporterCall{
-		Op:        "ReportRequestConcurrency",
-		Namespace: ns,
-		Service:   service,
-		Config:    config,
-		Revision:  rev,
-		Value:     v,
-	})
-
-	return nil
-}
-
-func (f *fakeReporter) ReportRequestCount(ns, service, config, rev string, responseCode, numTries int) error {
-	f.mux.Lock()
-	defer f.mux.Unlock()
-	f.calls = append(f.calls, reporterCall{
-		Op:         "ReportRequestCount",
-		Namespace:  ns,
-		Service:    service,
-		Config:     config,
-		Revision:   rev,
-		StatusCode: responseCode,
-		Attempts:   numTries,
-		Value:      1,
-	})
-
-	return nil
-}
-
-func (f *fakeReporter) ReportResponseTime(ns, service, config, rev string, responseCode int, d time.Duration) error {
-	f.mux.Lock()
-	defer f.mux.Unlock()
-	f.calls = append(f.calls, reporterCall{
-		Op:         "ReportResponseTime",
-		Namespace:  ns,
-		Service:    service,
-		Config:     config,
-		Revision:   rev,
-		StatusCode: responseCode,
-		Duration:   d,
-	})
-
-	return nil
-}
-
-func revision(namespace, name string) *v1alpha1.Revision {
-	return &v1alpha1.Revision{
+func revision(namespace, name string) *v1.Revision {
+	return &v1.Revision{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      name,
 			Labels: map[string]string{
-				serving.ConfigurationLabelKey: "config-" + testRevName,
-				serving.ServiceLabelKey:       "service-" + testRevName,
+				serving.ConfigurationLabelKey: "config-" + name,
+				serving.ServiceLabelKey:       "service-" + name,
 			},
 		},
-		Spec: v1alpha1.RevisionSpec{
-			RevisionSpec: v1.RevisionSpec{
-				ContainerConcurrency: ptr.Int64(1),
-			},
+		Spec: v1.RevisionSpec{
+			ContainerConcurrency: ptr.Int64(1),
 		},
 	}
-}
-
-func revisionInformer(ctx context.Context, revs ...*v1alpha1.Revision) servingv1informers.RevisionInformer {
-	fake := fakeservingclient.Get(ctx)
-	revisions := fakerevisioninformer.Get(ctx)
-
-	for _, rev := range revs {
-		fake.ServingV1alpha1().Revisions(rev.Namespace).Create(rev)
-		revisions.Informer().GetIndexer().Add(rev)
-	}
-
-	return revisions
 }
 
 func setupConfigStore(t *testing.T, logger *zap.SugaredLogger) *activatorconfig.Store {
@@ -445,6 +295,88 @@ func setupConfigStore(t *testing.T, logger *zap.SugaredLogger) *activatorconfig.
 	return configStore
 }
 
-func errMsg(msg string) string {
-	return fmt.Sprintf("Error getting active endpoint: %v\n", msg)
+func BenchmarkHandler(b *testing.B) {
+	ctx, cancel, _ := rtesting.SetupFakeContextWithCancel(&testing.T{})
+	b.Cleanup(cancel)
+	configStore := setupConfigStore(&testing.T{}, logging.FromContext(ctx))
+
+	// bodyLength is in kilobytes.
+	for _, bodyLength := range [5]int{2, 16, 32, 64, 128} {
+		body := []byte(randomString(1024 * bodyLength))
+
+		rt := pkgnet.RoundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				Body:       ioutil.NopCloser(bytes.NewReader(body)),
+				StatusCode: http.StatusOK,
+			}, nil
+		})
+
+		handler := New(ctx, fakeThrottler{}, rt)
+
+		request := func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+			req.Host = "test-host"
+
+			reqCtx := configStore.ToContext(context.Background())
+			reqCtx = WithRevID(reqCtx, types.NamespacedName{Namespace: testNamespace, Name: testRevName})
+			return req.WithContext(reqCtx)
+		}
+
+		test := func(req *http.Request, b *testing.B) {
+			resp := &responseRecorder{}
+			handler.ServeHTTP(resp, req)
+			if resp.code != http.StatusOK {
+				b.Fatalf("resp.Code = %d, want: StatusOK(200)", resp.code)
+			}
+			if got, want := resp.size.Load(), int32(len(body)); got != want {
+				b.Fatalf("|body| = %d, want = %d", got, want)
+			}
+		}
+
+		b.Run(fmt.Sprintf("%03dk-resp-len-sequential", bodyLength), func(b *testing.B) {
+			req := request()
+			for j := 0; j < b.N; j++ {
+				test(req, b)
+			}
+		})
+
+		b.Run(fmt.Sprintf("%03dk-resp-len-parallel", bodyLength), func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				req := request()
+				for pb.Next() {
+					test(req, b)
+				}
+			})
+		})
+	}
+}
+
+func randomString(n int) string {
+	letter := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letter[rand.Intn(len(letter))]
+	}
+	return string(b)
+}
+
+// responseRecorder is an implementation of http.ResponseWriter and http.Flusher
+// that captures the response code and size.
+type responseRecorder struct {
+	code int
+	size atomic.Int32
+}
+
+func (rr *responseRecorder) Header() http.Header {
+	return http.Header{}
+}
+
+func (rr *responseRecorder) Write(p []byte) (int, error) {
+	rr.size.Add(int32(len(p)))
+	return len(p), nil
+}
+
+func (rr *responseRecorder) WriteHeader(code int) {
+	rr.code = code
 }

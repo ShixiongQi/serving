@@ -19,11 +19,14 @@ limitations under the License.
 package test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sync"
 	"testing"
+
+	"go.uber.org/atomic"
 
 	"golang.org/x/sync/errgroup"
 	pkgTest "knative.dev/pkg/test"
@@ -50,16 +53,15 @@ type prober struct {
 	url           *url.URL
 	minimumProbes int64
 
-	// m guards access to these fields
-	m        sync.RWMutex
-	requests int64
-	failures int64
-	stopped  bool
+	requests atomic.Int64
+	failures atomic.Int64
 
-	// This channel is used to send errors encountered probing the domain.
-	errCh chan error
 	// This channel is simply closed when minimumProbes has been satisfied.
 	minDoneCh chan struct{}
+
+	errGrp *errgroup.Group
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // prober implements Prober
@@ -67,60 +69,21 @@ var _ Prober = (*prober)(nil)
 
 // SLI implements Prober
 func (p *prober) SLI() (int64, int64) {
-	p.m.RLock()
-	defer p.m.RUnlock()
-
-	return p.requests, p.failures
+	return p.requests.Load(), p.failures.Load()
 }
 
 // Stop implements Prober
 func (p *prober) Stop() error {
-	// When we're done stop sending requests.
-	defer func() {
-		p.m.Lock()
-		defer p.m.Unlock()
-		p.stopped = true
-	}()
-
-	// Check for any immediately available errors
+	// Wait for either an error to happen or the minimumProbes we want.
 	select {
-	case err := <-p.errCh:
-		return err
-	default:
-		// Don't block if there are no errors immediately available.
-	}
-
-	// If there aren't any immediately available errors, then
-	// wait for either an error or the minimum number of probes
-	// to be satisfied.
-	select {
-	case err := <-p.errCh:
-		return err
+	case <-p.ctx.Done():
 	case <-p.minDoneCh:
-		return nil
-	}
-}
-
-func (p *prober) handleResponse(response *spoof.Response) (bool, error) {
-	p.m.Lock()
-	defer p.m.Unlock()
-
-	if p.stopped {
-		return p.stopped, nil
 	}
 
-	p.requests++
-	if response.StatusCode != http.StatusOK {
-		p.logf("%q status = %d, want: %d", p.url, response.StatusCode, http.StatusOK)
-		p.logf("response: %s", response)
-		p.failures++
-	}
-	if p.requests == p.minimumProbes {
-		close(p.minDoneCh)
-	}
+	// Stop all probing.
+	p.cancel()
 
-	// Returning (false, nil) causes SpoofingClient.Poll to retry.
-	return false, nil
+	return p.errGrp.Wait()
 }
 
 // ProberManager is the interface for spawning probers, and checking their results.
@@ -142,8 +105,9 @@ type manager struct {
 	clients   *Clients
 	minProbes int64
 
-	m      sync.RWMutex
-	probes map[*url.URL]Prober
+	m                sync.RWMutex
+	probes           map[*url.URL]Prober
+	transportOptions []spoof.TransportOption
 }
 
 var _ ProberManager = (*manager)(nil)
@@ -158,42 +122,56 @@ func (m *manager) Spawn(url *url.URL) Prober {
 	}
 
 	m.logf("Starting Route prober for %s.", url)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errGrp, ctx := errgroup.WithContext(ctx)
+
 	p := &prober{
 		logf:          m.logf,
 		url:           url,
 		minimumProbes: m.minProbes,
-		errCh:         make(chan error, 1),
-		minDoneCh:     make(chan struct{}),
+
+		minDoneCh: make(chan struct{}),
+
+		errGrp: errGrp,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	m.probes[url] = p
-	go func() {
-		client, err := pkgTest.NewSpoofingClient(m.clients.KubeClient, m.logf, url.Hostname(), ServingFlags.ResolvableDomain)
+
+	errGrp.Go(func() error {
+		client, err := pkgTest.NewSpoofingClient(ctx, m.clients.KubeClient, m.logf, url.Hostname(), ServingFlags.ResolvableDomain, m.transportOptions...)
 		if err != nil {
-			m.logf("NewSpoofingClient() = %v", err)
-			p.errCh <- err
-			return
+			return fmt.Errorf("failed to generate client: %w", err)
 		}
 
-		// RequestTimeout is set to 0 to make the polling infinite.
-		client.RequestTimeout = 0
 		req, err := http.NewRequest(http.MethodGet, url.String(), nil)
 		if err != nil {
-			m.logf("NewRequest() = %v", err)
-			p.errCh <- err
-			return
+			return fmt.Errorf("failed to generate request: %w", err)
 		}
 
 		// We keep polling the domain and accumulate success rates
 		// to ultimately establish the SLI and compare to the SLO.
-		_, err = client.Poll(req, p.handleResponse)
-		if err != nil {
-			// SLO violations are not reflected as errors. They are
-			// captured and calculated internally.
-			m.logf("Poll() = %v", err)
-			p.errCh <- err
-			return
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				res, err := client.Do(req)
+				if p.requests.Inc() == p.minimumProbes {
+					close(p.minDoneCh)
+				}
+				if err != nil {
+					p.logf("%q error: %v", p.url, err)
+					p.failures.Inc()
+				} else if res.StatusCode != http.StatusOK {
+					p.logf("%q status = %d, want: %d", p.url, res.StatusCode, http.StatusOK)
+					p.logf("response: %s", res)
+					p.failures.Inc()
+				}
+			}
 		}
-	}()
+	})
 	return p
 }
 
@@ -204,7 +182,7 @@ func (m *manager) Stop() error {
 
 	m.logf("Stopping all probers")
 
-	errgrp := &errgroup.Group{}
+	errgrp := errgroup.Group{}
 	for _, prober := range m.probes {
 		errgrp.Go(prober.Stop)
 	}
@@ -212,7 +190,7 @@ func (m *manager) Stop() error {
 }
 
 // SLI implements Prober
-func (m *manager) SLI() (total int64, failures int64) {
+func (m *manager) SLI() (total, failures int64) {
 	m.m.RLock()
 	defer m.m.RUnlock()
 	for _, prober := range m.probes {
@@ -234,19 +212,20 @@ func (m *manager) Foreach(f func(url *url.URL, p Prober)) {
 }
 
 // NewProberManager creates a new manager for probes.
-func NewProberManager(logf logging.FormatLogger, clients *Clients, minProbes int64) ProberManager {
+func NewProberManager(logf logging.FormatLogger, clients *Clients, minProbes int64, opts ...spoof.TransportOption) ProberManager {
 	return &manager{
-		logf:      logf,
-		clients:   clients,
-		minProbes: minProbes,
-		probes:    make(map[*url.URL]Prober),
+		logf:             logf,
+		clients:          clients,
+		minProbes:        minProbes,
+		probes:           make(map[*url.URL]Prober),
+		transportOptions: opts,
 	}
 }
 
 // RunRouteProber starts a single Prober of the given domain.
-func RunRouteProber(logf logging.FormatLogger, clients *Clients, url *url.URL) Prober {
+func RunRouteProber(logf logging.FormatLogger, clients *Clients, url *url.URL, opts ...spoof.TransportOption) Prober {
 	// Default to 10 probes
-	pm := NewProberManager(logf, clients, 10)
+	pm := NewProberManager(logf, clients, 10, opts...)
 	pm.Spawn(url)
 	return pm
 }
@@ -254,14 +233,21 @@ func RunRouteProber(logf logging.FormatLogger, clients *Clients, url *url.URL) P
 // AssertProberDefault is a helper for stopping the Prober and checking its SLI
 // against the default SLO, which requires perfect responses.
 // This takes `testing.T` so that it may be used in `defer`.
-func AssertProberDefault(t *testing.T, p Prober) {
+func AssertProberDefault(t testing.TB, p Prober) {
+	t.Helper()
+	AssertProberSLO(t, p, 1.0)
+}
+
+// AssertProberSLO is a helper for stopping the Prober and checking its SLI
+// against the given SLO.
+func AssertProberSLO(t testing.TB, p Prober, slo float64) {
 	t.Helper()
 	if err := p.Stop(); err != nil {
-		t.Errorf("Stop() = %v", err)
+		t.Error("Stop()", "error", err.Error())
 	}
 	// Default to 100% correct (typically used in conjunction with the low probe count above)
-	if err := CheckSLO(1.0, t.Name(), p); err != nil {
-		t.Errorf("CheckSLO() = %v", err)
+	if err := CheckSLO(slo, t.Name(), p); err != nil {
+		t.Error("CheckSLO()", "error", err.Error())
 	}
 }
 

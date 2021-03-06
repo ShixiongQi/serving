@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,8 +26,10 @@ import (
 )
 
 // ServiceLister helps list Services.
+// All objects returned here must be treated as read-only.
 type ServiceLister interface {
 	// List lists all Services in the indexer.
+	// Objects returned here must be treated as read-only.
 	List(selector labels.Selector) (ret []*v1.Service, err error)
 	// Services returns an object that can list and get Services.
 	Services(namespace string) ServiceNamespaceLister
@@ -58,10 +60,13 @@ func (s *serviceLister) Services(namespace string) ServiceNamespaceLister {
 }
 
 // ServiceNamespaceLister helps list and get Services.
+// All objects returned here must be treated as read-only.
 type ServiceNamespaceLister interface {
 	// List lists all Services in the indexer for a given namespace.
+	// Objects returned here must be treated as read-only.
 	List(selector labels.Selector) (ret []*v1.Service, err error)
 	// Get retrieves the Service from the indexer for a given namespace and name.
+	// Objects returned here must be treated as read-only.
 	Get(name string) (*v1.Service, error)
 	ServiceNamespaceListerExpansion
 }

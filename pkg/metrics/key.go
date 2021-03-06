@@ -27,15 +27,9 @@ import (
 // - length between 1 and 255 inclusive
 // - characters are printable US-ASCII
 var (
-	NamespaceTagKey      = tag.MustNewKey(metricskey.LabelNamespaceName)
-	ServiceTagKey        = tag.MustNewKey(metricskey.LabelServiceName)
-	ConfigTagKey         = tag.MustNewKey(metricskey.LabelConfigurationName)
-	RevisionTagKey       = tag.MustNewKey(metricskey.LabelRevisionName)
-	PodTagKey            = tag.MustNewKey("pod_name")
-	ContainerTagKey      = tag.MustNewKey("container_name")
-	ResponseCodeKey      = tag.MustNewKey("response_code")
-	ResponseCodeClassKey = tag.MustNewKey("response_code_class")
-	NumTriesKey          = tag.MustNewKey("num_tries")
-
-	CommonRevisionKeys = []tag.Key{NamespaceTagKey, ServiceTagKey, ConfigTagKey, RevisionTagKey}
+	PodTagKey            = tag.MustNewKey(metricskey.PodName)
+	ContainerTagKey      = tag.MustNewKey(metricskey.ContainerName)
+	ResponseCodeKey      = tag.MustNewKey(metricskey.LabelResponseCode)
+	ResponseCodeClassKey = tag.MustNewKey(metricskey.LabelResponseCodeClass)
+	RouteTagKey          = tag.MustNewKey("tag")
 )

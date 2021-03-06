@@ -13,16 +13,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package v1
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	netv1alpha1 "knative.dev/networking/pkg/apis/networking/v1alpha1"
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/apis/duck"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
+	apistest "knative.dev/pkg/apis/testing"
+	"knative.dev/serving/pkg/apis/serving"
 )
 
 func TestRouteDuckTypes(t *testing.T) {
@@ -44,6 +50,14 @@ func TestRouteDuckTypes(t *testing.T) {
 	}
 }
 
+func TestRouteGetConditionSet(t *testing.T) {
+	r := &Route{}
+
+	if got, want := r.GetConditionSet().GetTopLevelConditionType(), apis.ConditionReady; got != want {
+		t.Errorf("GetTopLevelCondition=%v, want=%v", got, want)
+	}
+}
+
 func TestRouteGetGroupVersionKind(t *testing.T) {
 	r := &Route{}
 	want := schema.GroupVersionKind{
@@ -57,54 +71,455 @@ func TestRouteGetGroupVersionKind(t *testing.T) {
 }
 
 func TestRouteIsReady(t *testing.T) {
-	tests := []struct {
-		name     string
-		rs       *RouteStatus
-		expected bool
+	cases := []struct {
+		name    string
+		status  RouteStatus
+		isReady bool
 	}{{
-		name:     "Ready undefined",
-		rs:       &RouteStatus{},
-		expected: false,
+		name:    "empty status should not be ready",
+		status:  RouteStatus{},
+		isReady: false,
 	}, {
-		name: "Ready=False",
-		rs: &RouteStatus{
+		name: "Different condition type should not be ready",
+		status: RouteStatus{
 			Status: duckv1.Status{
 				Conditions: duckv1.Conditions{{
-					Type:   apis.ConditionReady,
-					Status: corev1.ConditionFalse,
-				}},
-			},
-		},
-		expected: false,
-	}, {
-		name: "Ready=Unknown",
-		rs: &RouteStatus{
-			Status: duckv1.Status{
-				Conditions: duckv1.Conditions{{
-					Type:   apis.ConditionReady,
-					Status: corev1.ConditionUnknown,
-				}},
-			},
-		},
-		expected: false,
-	}, {
-		name: "Ready=True",
-		rs: &RouteStatus{
-			Status: duckv1.Status{
-				Conditions: duckv1.Conditions{{
-					Type:   apis.ConditionReady,
+					Type:   RouteConditionAllTrafficAssigned,
 					Status: corev1.ConditionTrue,
 				}},
 			},
 		},
-		expected: true,
+		isReady: false,
+	}, {
+		name: "False condition status should not be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionFalse,
+				}},
+			},
+		},
+		isReady: false,
+	}, {
+		name: "Unknown condition status should not be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionUnknown,
+				}},
+			},
+		},
+		isReady: false,
+	}, {
+		name: "Missing condition status should not be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type: RouteConditionReady,
+				}},
+			},
+		},
+		isReady: false,
+	}, {
+		name: "True condition status should be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		},
+		isReady: true,
+	}, {
+		name: "Multiple conditions with ready status should be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionAllTrafficAssigned,
+					Status: corev1.ConditionTrue,
+				}, {
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		},
+		isReady: true,
+	}, {
+		name: "Multiple conditions with ready status false should not be ready",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionAllTrafficAssigned,
+					Status: corev1.ConditionTrue,
+				}, {
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionFalse,
+				}},
+			},
+		},
+		isReady: false,
 	}}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			ready := test.rs.IsReady()
-			if ready != test.expected {
-				t.Errorf("IsReady() = %t; expected %t", ready, test.expected)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Route{Status: tc.status}
+			if e, a := tc.isReady, r.IsReady(); e != a {
+				t.Errorf("%q expected: %v got: %v", tc.name, e, a)
+			}
+
+			r.Generation = 1
+			r.Status.ObservedGeneration = 2
+			if r.IsReady() {
+				t.Error("Expected IsReady() to be false when Generation != ObservedGeneration")
+			}
+		})
+	}
+}
+
+func TestRouteIsFailed(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   RouteStatus
+		isFailed bool
+	}{{
+		name:     "empty status should not be failed",
+		status:   RouteStatus{},
+		isFailed: false,
+	}, {
+		name: "False condition status should be failed",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionFalse,
+				}},
+			},
+		},
+		isFailed: true,
+	}, {
+		name: "Unknown condition status should not be failed",
+		status: RouteStatus{
+			Status: duckv1.Status{
+
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionUnknown,
+				}},
+			},
+		},
+		isFailed: false,
+	}, {
+		name: "Missing condition status should not be failed",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type: RouteConditionReady,
+				}},
+			},
+		},
+		isFailed: false,
+	}, {
+		name: "True condition status should not be failed",
+		status: RouteStatus{
+			Status: duckv1.Status{
+				Conditions: duckv1.Conditions{{
+					Type:   RouteConditionReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		},
+		isFailed: false,
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Route{Status: tc.status}
+			if e, a := tc.isFailed, r.IsFailed(); e != a {
+				t.Errorf("%q expected: %v got: %v", tc.name, e, a)
+			}
+		})
+	}
+}
+
+func TestTypicalRouteFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkTrafficAssigned()
+	r.MarkTLSNotEnabled(AutoTLSNotEnabledMessage)
+	apistest.CheckConditionSucceeded(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	})
+	apistest.CheckConditionSucceeded(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionReady, t)
+}
+
+func TestTrafficNotAssignedFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkMissingTrafficTarget("Revision", "does-not-exist")
+	apistest.CheckConditionFailed(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionFailed(r, RouteConditionReady, t)
+}
+
+func TestTargetConfigurationNotYetReadyFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkConfigurationNotReady("i-have-no-ready-revision")
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+}
+
+func TestUnknownErrorWhenConfiguringTraffic(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkUnknownTrafficError("unknown-error")
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+}
+
+func TestTargetConfigurationFailedToBeReadyFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkConfigurationFailed("permanently-failed")
+	apistest.CheckConditionFailed(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionFailed(r, RouteConditionReady, t)
+}
+
+func TestTargetRevisionNotYetReadyFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkRevisionNotReady("not-yet-ready")
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+}
+
+func TestTargetRevisionFailedToBeReadyFlow(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkRevisionFailed("cannot-find-image")
+	apistest.CheckConditionFailed(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionFailed(r, RouteConditionReady, t)
+}
+
+func TestIngressFailureRecovery(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionUnknown,
+			}},
+		},
+	})
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	// Empty IngressStatus marks ingress "NotConfigured"
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{})
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkTrafficAssigned()
+	r.MarkTLSNotEnabled(AutoTLSNotEnabledMessage)
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	})
+	apistest.CheckConditionSucceeded(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionReady, t)
+
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionFalse,
+			}},
+		},
+	})
+	apistest.CheckConditionSucceeded(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionFailed(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionFailed(r, RouteConditionReady, t)
+
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	})
+	apistest.CheckConditionSucceeded(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionSucceeded(r, RouteConditionReady, t)
+}
+
+func TestRouteNotOwnedStuff(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.PropagateIngressStatus(netv1alpha1.IngressStatus{
+		Status: duckv1.Status{
+			Conditions: duckv1.Conditions{{
+				Type:   netv1alpha1.IngressConditionReady,
+				Status: corev1.ConditionUnknown,
+			}},
+		},
+	})
+
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionOngoing(r, RouteConditionReady, t)
+
+	r.MarkServiceNotOwned("evan")
+	apistest.CheckConditionOngoing(r, RouteConditionAllTrafficAssigned, t)
+	apistest.CheckConditionFailed(r, RouteConditionIngressReady, t)
+	apistest.CheckConditionFailed(r, RouteConditionReady, t)
+}
+
+func TestCertificateReady(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkCertificateReady("cert")
+
+	apistest.CheckConditionSucceeded(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestCertificateNotReady(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkCertificateNotReady("cert")
+
+	apistest.CheckConditionOngoing(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestCertificateProvisionFailed(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkCertificateProvisionFailed("cert")
+
+	apistest.CheckConditionFailed(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestRouteNotOwnCertificate(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkCertificateNotOwned("cert")
+
+	apistest.CheckConditionFailed(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestRouteAutoTLSNotEnabled(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkTLSNotEnabled(AutoTLSNotEnabledMessage)
+
+	apistest.CheckConditionSucceeded(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestRouteHTTPDowngrade(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkHTTPDowngrade("cert")
+
+	apistest.CheckConditionSucceeded(r, RouteConditionCertificateProvisioned, t)
+}
+
+func TestIngressNotConfigured(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkIngressNotConfigured()
+
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+}
+
+func TestMarkInRollout(t *testing.T) {
+	r := &RouteStatus{}
+	r.InitializeConditions()
+	r.MarkIngressRolloutInProgress()
+
+	apistest.CheckConditionOngoing(r, RouteConditionIngressReady, t)
+}
+
+func TestRolloutDuration(t *testing.T) {
+	tests := []struct {
+		name string
+		val  string
+		want time.Duration
+	}{{
+		name: "empty",
+		val:  "",
+		want: 0,
+	}, {
+		name: "invalid",
+		val:  "not-a-duration",
+		want: 0,
+	}, {
+		name: "duration",
+		val:  "2m1982s",
+		want: 2*time.Minute + 1982*time.Second,
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Route{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						serving.RolloutDurationKey: tc.val,
+					},
+				},
+			}
+			if got, want := r.RolloutDuration(), tc.want; got != want {
+				t.Errorf("RolloutDuration = %v, want: %v", got, want)
 			}
 		})
 	}

@@ -19,15 +19,16 @@ limitations under the License.
 package v1
 
 import (
+	"context"
 	"net/url"
 	"testing"
 
-	pkgTest "knative.dev/pkg/test"
+	pkgtest "knative.dev/pkg/test"
+	"knative.dev/pkg/test/spoof"
 	v1 "knative.dev/serving/pkg/apis/serving/v1"
+	rtesting "knative.dev/serving/pkg/testing/v1"
 	"knative.dev/serving/test"
 	v1test "knative.dev/serving/test/v1"
-
-	rtesting "knative.dev/serving/pkg/testing/v1"
 )
 
 func assertResourcesUpdatedWhenRevisionIsReady(t *testing.T, clients *test.Clients, names test.ResourceNames, url *url.URL, expectedGeneration, expectedText string) {
@@ -39,13 +40,15 @@ func assertResourcesUpdatedWhenRevisionIsReady(t *testing.T, clients *test.Clien
 	// TODO(#1178): Remove "Wait" from all checks below this point.
 	t.Log("Serves the expected data at the endpoint")
 
-	_, err := pkgTest.WaitForEndpointState(
+	_, err := pkgtest.WaitForEndpointState(
+		context.Background(),
 		clients.KubeClient,
 		t.Logf,
 		url,
-		v1test.RetryingRouteInconsistency(pkgTest.MatchesAllOf(pkgTest.IsStatusOK, pkgTest.EventuallyMatchesBody(expectedText))),
+		v1test.RetryingRouteInconsistency(spoof.MatchesAllOf(spoof.IsStatusOK, pkgtest.EventuallyMatchesBody(expectedText))),
 		"WaitForEndpointToServeText",
-		test.ServingFlags.ResolvableDomain)
+		test.ServingFlags.ResolvableDomain,
+		test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS))
 	if err != nil {
 		t.Fatalf("The endpoint for Route %s at %s didn't serve the expected text %q: %v", names.Route, url, expectedText, err)
 	}
@@ -69,8 +72,7 @@ func assertResourcesUpdatedWhenRevisionIsReady(t *testing.T, clients *test.Clien
 		t.Fatalf("The Configuration %s was not updated indicating that the Revision %s was ready: %v", names.Config, names.Revision, err)
 	}
 	t.Log("Updates the Route to route traffic to the Revision")
-	err = v1test.CheckRouteState(clients.ServingClient, names.Route, v1test.AllRouteTrafficAtRevision(names))
-	if err != nil {
+	if err := v1test.WaitForRouteState(clients.ServingClient, names.Route, v1test.AllRouteTrafficAtRevision(names), "AllRouteTrafficAtRevision"); err != nil {
 		t.Fatalf("The Route %s was not updated to route traffic to the Revision %s: %v", names.Route, names.Revision, err)
 	}
 }
@@ -107,24 +109,23 @@ func TestRouteCreation(t *testing.T) {
 		Image:         test.PizzaPlanet1,
 	}
 
-	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
-	defer test.TearDown(clients, names)
+	test.EnsureTearDown(t, clients, &names)
 
 	t.Log("Creating a new Route and Configuration")
 	config, err := v1test.CreateConfiguration(t, clients, names)
 	if err != nil {
-		t.Fatalf("Failed to create Configuration: %v", err)
+		t.Fatal("Failed to create Configuration:", err)
 	}
 	objects.Config = config
 
 	route, err := v1test.CreateRoute(t, clients, names)
 	if err != nil {
-		t.Fatalf("Failed to create Route: %v", err)
+		t.Fatal("Failed to create Route:", err)
 	}
 	objects.Route = route
 
 	t.Log("The Configuration will be updated with the name of the Revision")
-	names.Revision, err = v1test.WaitForConfigLatestRevision(clients, names)
+	names.Revision, err = v1test.WaitForConfigLatestPinnedRevision(clients, names)
 	if err != nil {
 		t.Fatalf("Configuration %s was not updated with the new revision: %v", names.Config, err)
 	}
@@ -134,24 +135,31 @@ func TestRouteCreation(t *testing.T) {
 		t.Fatalf("Failed to get URL from route %s: %v", names.Route, err)
 	}
 
-	t.Logf("The Route URL is: %s", url)
+	t.Log("The Route URL is:", url)
 	assertResourcesUpdatedWhenRevisionIsReady(t, clients, names, url, "1", test.PizzaPlanetText1)
 
 	// We start a prober at background thread to test if Route is always healthy even during Route update.
-	prober := test.RunRouteProber(t.Logf, clients, url)
+	prober := test.RunRouteProber(t.Logf, clients, url, test.AddRootCAtoTransport(context.Background(), t.Logf, clients, test.ServingFlags.HTTPS))
 	defer test.AssertProberDefault(t, prober)
 
 	t.Log("Updating the Configuration to use a different image")
-	objects.Config, err = v1test.PatchConfig(t, clients, objects.Config, rtesting.WithConfigImage(pkgTest.ImagePath(test.PizzaPlanet2)))
+	objects.Config, err = v1test.PatchConfig(t, clients, objects.Config, withConfigImage(pkgtest.ImagePath(test.PizzaPlanet2)))
 	if err != nil {
 		t.Fatalf("Patch update for Configuration %s with new image %s failed: %v", names.Config, test.PizzaPlanet2, err)
 	}
 
 	t.Log("Since the Configuration was updated a new Revision will be created and the Configuration will be updated")
-	names.Revision, err = v1test.WaitForConfigLatestRevision(clients, names)
+	names.Revision, err = v1test.WaitForConfigLatestPinnedRevision(clients, names)
 	if err != nil {
 		t.Fatalf("Configuration %s was not updated with the Revision for image %s: %v", names.Config, test.PizzaPlanet2, err)
 	}
 
 	assertResourcesUpdatedWhenRevisionIsReady(t, clients, names, url, "2", test.PizzaPlanetText2)
+}
+
+// withConfigImage sets the container image to be the provided string.
+func withConfigImage(img string) rtesting.ConfigOption {
+	return func(cfg *v1.Configuration) {
+		cfg.Spec.Template.Spec.Containers[0].Image = img
+	}
 }

@@ -26,12 +26,10 @@ import (
 	"knative.dev/pkg/ptr"
 	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/autoscaling/v1alpha1"
-	servingv1alpha1 "knative.dev/serving/pkg/apis/serving/v1alpha1"
-	"knative.dev/serving/pkg/autoscaler"
+	"knative.dev/serving/pkg/autoscaler/config/autoscalerconfig"
 
 	autoscalingv2beta1 "k8s.io/api/autoscaling/v2beta1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	. "knative.dev/serving/pkg/testing"
@@ -85,90 +83,16 @@ func TestMakeHPA(t *testing.T) {
 					TargetAverageUtilization: ptr.Int32(1983),
 				},
 			})),
-	}, {
-		name: "with metric=concurrency",
-		pa:   pa(WithMetricAnnotation(autoscaling.Concurrency)),
-		want: hpa(
-			withAnnotationValue(autoscaling.MetricAnnotationKey, autoscaling.Concurrency),
-			withMetric(autoscalingv2beta1.MetricSpec{
-				Type: autoscalingv2beta1.ObjectMetricSourceType,
-				Object: &autoscalingv2beta1.ObjectMetricSource{
-					Target: autoscalingv2beta1.CrossVersionObjectReference{
-						APIVersion: servingv1alpha1.SchemeGroupVersion.String(),
-						Kind:       "revision",
-						Name:       testName,
-					},
-					MetricName:   autoscaling.Concurrency,
-					AverageValue: resource.NewQuantity(100, resource.DecimalSI),
-					TargetValue:  *resource.NewQuantity(100, resource.DecimalSI),
-				},
-			})),
-	}, {
-		name: "with metric=concurrency and target=50",
-		pa:   pa(WithTargetAnnotation("50"), WithMetricAnnotation(autoscaling.Concurrency)),
-		want: hpa(
-			withAnnotationValue(autoscaling.MetricAnnotationKey, autoscaling.Concurrency),
-			withAnnotationValue(autoscaling.TargetAnnotationKey, "50"),
-			withMetric(autoscalingv2beta1.MetricSpec{
-				Type: autoscalingv2beta1.ObjectMetricSourceType,
-				Object: &autoscalingv2beta1.ObjectMetricSource{
-					Target: autoscalingv2beta1.CrossVersionObjectReference{
-						APIVersion: servingv1alpha1.SchemeGroupVersion.String(),
-						Kind:       "revision",
-						Name:       testName,
-					},
-					MetricName:   autoscaling.Concurrency,
-					AverageValue: resource.NewQuantity(50, resource.DecimalSI),
-					TargetValue:  *resource.NewQuantity(50, resource.DecimalSI),
-				},
-			})),
-	}, {
-		name: "with metric=RPS",
-		pa:   pa(WithMetricAnnotation(autoscaling.RPS)),
-		want: hpa(
-			withAnnotationValue(autoscaling.MetricAnnotationKey, autoscaling.RPS),
-			withMetric(autoscalingv2beta1.MetricSpec{
-				Type: autoscalingv2beta1.ObjectMetricSourceType,
-				Object: &autoscalingv2beta1.ObjectMetricSource{
-					Target: autoscalingv2beta1.CrossVersionObjectReference{
-						APIVersion: servingv1alpha1.SchemeGroupVersion.String(),
-						Kind:       "revision",
-						Name:       testName,
-					},
-					MetricName:   autoscaling.RPS,
-					AverageValue: resource.NewQuantity(200, resource.DecimalSI),
-					TargetValue:  *resource.NewQuantity(200, resource.DecimalSI),
-				},
-			})),
-	}, {
-		name: "with metric=RPS and target=50",
-		pa:   pa(WithTargetAnnotation("50"), WithMetricAnnotation(autoscaling.RPS)),
-		want: hpa(
-			withAnnotationValue(autoscaling.MetricAnnotationKey, autoscaling.RPS),
-			withAnnotationValue(autoscaling.TargetAnnotationKey, "50"),
-			withMetric(autoscalingv2beta1.MetricSpec{
-				Type: autoscalingv2beta1.ObjectMetricSourceType,
-				Object: &autoscalingv2beta1.ObjectMetricSource{
-					Target: autoscalingv2beta1.CrossVersionObjectReference{
-						APIVersion: servingv1alpha1.SchemeGroupVersion.String(),
-						Kind:       "revision",
-						Name:       testName,
-					},
-					MetricName:   autoscaling.RPS,
-					AverageValue: resource.NewQuantity(50, resource.DecimalSI),
-					TargetValue:  *resource.NewQuantity(50, resource.DecimalSI),
-				},
-			})),
 	}}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := MakeHPA(tc.pa, config)
 			if equal, err := kmp.SafeEqual(tc.want, got); err != nil {
-				t.Errorf("Got error comparing output, err = %v", err)
+				t.Error("Got error comparing output, err =", err)
 			} else if !equal {
 				if diff, err := kmp.SafeDiff(tc.want, got); err != nil {
-					t.Errorf("Got error diffing output, err = %v", err)
+					t.Error("Got error diffing output, err =", err)
 				} else {
 					t.Errorf("MakeHPA() = (-want, +got):\n%v", diff)
 				}
@@ -239,7 +163,7 @@ type hpaOption func(*autoscalingv2beta1.HorizontalPodAutoscaler)
 func withAnnotationValue(key, value string) hpaOption {
 	return func(pa *autoscalingv2beta1.HorizontalPodAutoscaler) {
 		if pa.Annotations == nil {
-			pa.Annotations = make(map[string]string)
+			pa.Annotations = make(map[string]string, 1)
 		}
 		pa.Annotations[key] = value
 	}
@@ -263,7 +187,7 @@ func withMetric(m autoscalingv2beta1.MetricSpec) hpaOption {
 	}
 }
 
-var config = &autoscaler.Config{
+var config = &autoscalerconfig.Config{
 	EnableScaleToZero:                  true,
 	ContainerConcurrencyTargetFraction: 1.0,
 	ContainerConcurrencyTargetDefault:  100.0,
@@ -272,8 +196,6 @@ var config = &autoscaler.Config{
 	MaxScaleUpRate:                     10.0,
 	StableWindow:                       60 * time.Second,
 	PanicThresholdPercentage:           200,
-	PanicWindow:                        6 * time.Second,
 	PanicWindowPercentage:              10,
-	TickInterval:                       2 * time.Second,
 	ScaleToZeroGracePeriod:             30 * time.Second,
 }

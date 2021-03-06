@@ -17,126 +17,79 @@ limitations under the License.
 package resources
 
 import (
-	"context"
+	"sort"
+	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 
+	"knative.dev/pkg/kmeta"
 	"knative.dev/serving/pkg/apis/serving"
-	v1 "knative.dev/serving/pkg/apis/serving/v1"
-	"knative.dev/serving/pkg/apis/serving/v1alpha1"
 )
 
-func makeConfiguration(service *v1alpha1.Service) (*v1alpha1.Configuration, error) {
-	// We do this prior to reconciliation, so test with it enabled.
-	service.SetDefaults(v1.WithUpgradeViaDefaulting(context.Background()))
-	return MakeConfiguration(service)
-}
+func TestConfigurationSpec(t *testing.T) {
+	s := createService()
+	s.Annotations = kmeta.UnionMaps(s.Annotations,
+		map[string]string{
+			serving.RolloutDurationKey: "2021s",
+		},
+	)
 
-func TestRunLatest(t *testing.T) {
-	s := createServiceWithRunLatest()
-	c, _ := makeConfiguration(s)
+	c := MakeConfiguration(s)
 	if got, want := c.Name, testServiceName; got != want {
-		t.Errorf("expected %q for service name got %q", want, got)
+		t.Errorf("Service name = %q; want: %q", got, want)
 	}
 	if got, want := c.Namespace, testServiceNamespace; got != want {
-		t.Errorf("expected %q for service namespace got %q", want, got)
+		t.Errorf("Service namespace = %q; want: %q", got, want)
 	}
-	if got, want := c.Spec.GetTemplate().Spec.GetContainer().Name, testContainerNameRunLatest; got != want {
-		t.Errorf("expected %q for container name got %q", want, got)
+	if got, want := c.Spec.GetTemplate().Spec.GetContainer().Name, testContainerName; got != want {
+		t.Errorf("Container name = %q; want: %q", got, want)
 	}
 	expectOwnerReferencesSetCorrectly(t, c.OwnerReferences)
 
-	if got, want := len(c.Labels), 3; got != want {
-		t.Errorf("expected %d labels got %d", want, got)
+	if got, want := c.Labels, map[string]string{
+		serving.ServiceLabelKey:    testServiceName,
+		serving.ServiceUIDLabelKey: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+	}; !cmp.Equal(got, want) {
+		t.Errorf("Labels mismatch: diff(-want,+got):\n%s", cmp.Diff(want, got))
 	}
-	if got, want := c.Labels[testLabelKey], testLabelValueRunLatest; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
+	if got, want := c.Annotations, map[string]string{
+		serving.RoutesAnnotationKey: testServiceName,
+	}; !cmp.Equal(got, want) {
+		t.Errorf("Annotations mismatch: diff(-want,+got):\n%s", cmp.Diff(want, got))
 	}
-	if got, want := c.Labels[serving.ServiceLabelKey], testServiceName; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
-	}
-}
 
-func TestPinned(t *testing.T) {
-	s := createServiceWithPinned()
-	c, _ := makeConfiguration(s)
-	if got, want := c.Name, testServiceName; got != want {
-		t.Errorf("expected %q for service name got %q", want, got)
+	// Create the configuration based on the same existing configuration.
+	c = MakeConfigurationFromExisting(s, c)
+	if got, want := c.Annotations, map[string]string{
+		serving.RoutesAnnotationKey: testServiceName,
+	}; !cmp.Equal(got, want) {
+		t.Errorf("Annotations mismatch: diff(-want,+got):\n%s", cmp.Diff(want, got))
 	}
-	if got, want := c.Namespace, testServiceNamespace; got != want {
-		t.Errorf("expected %q for service namespace got %q", want, got)
-	}
-	if got, want := c.Spec.GetTemplate().Spec.GetContainer().Name, testContainerNamePinned; got != want {
-		t.Errorf("expected %q for container name got %q", want, got)
-	}
-	expectOwnerReferencesSetCorrectly(t, c.OwnerReferences)
 
-	if got, want := len(c.Labels), 3; got != want {
-		t.Errorf("expected %d labels got %d", want, got)
-	}
-	if got, want := c.Labels[testLabelKey], testLabelValuePinned; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
-	}
-	if got, want := c.Labels[serving.ServiceLabelKey], testServiceName; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
-	}
-}
+	// Create the configuration based on the configuration with a different value for the
+	// annotation key serving.RoutesAnnotationKey.
+	const secTestServiceName = "second-test-service"
+	secondConfig := MakeConfigurationFromExisting(
+		createServiceWithName(secTestServiceName), c)
 
-func TestRelease(t *testing.T) {
-	s := createServiceWithRelease(1, 0)
-	c, _ := makeConfiguration(s)
-	if got, want := c.Name, testServiceName; got != want {
-		t.Errorf("expected %q for service name got %q", want, got)
-	}
-	if got, want := c.Namespace, testServiceNamespace; got != want {
-		t.Errorf("expected %q for service namespace got %q", want, got)
-	}
-	if got, want := c.Spec.GetTemplate().Spec.GetContainer().Name, testContainerNameRelease; got != want {
-		t.Errorf("expected %q for container name got %q", want, got)
-	}
-	expectOwnerReferencesSetCorrectly(t, c.OwnerReferences)
+	// MakeConfigurationFromExisting employs maps in process, so order is
+	// not guaranteed.
+	annoValue := secondConfig.Annotations[serving.RoutesAnnotationKey]
+	got := strings.Split(annoValue, ",")
+	sort.Strings(got)
 
-	if got, want := len(c.Labels), 3; got != want {
-		t.Errorf("expected %d labels got %d", want, got)
-	}
-	if got, want := c.Labels[testLabelKey], testLabelValueRelease; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
-	}
-	if got, want := c.Labels[serving.ServiceLabelKey], testServiceName; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
-	}
-}
-
-func TestInlineConfigurationSpec(t *testing.T) {
-	s := createServiceInline()
-	c, _ := makeConfiguration(s)
-	if got, want := c.Name, testServiceName; got != want {
-		t.Errorf("expected %q for service name got %q", want, got)
-	}
-	if got, want := c.Namespace, testServiceNamespace; got != want {
-		t.Errorf("expected %q for service namespace got %q", want, got)
-	}
-	if got, want := c.Spec.GetTemplate().Spec.GetContainer().Name, testContainerNameInline; got != want {
-		t.Errorf("expected %q for container name got %q", want, got)
-	}
-	expectOwnerReferencesSetCorrectly(t, c.OwnerReferences)
-
-	if got, want := len(c.Labels), 2; got != want {
-		t.Errorf("expected %d labels got %d", want, got)
-	}
-	if got, want := c.Labels[serving.ServiceLabelKey], testServiceName; got != want {
-		t.Errorf("expected %q labels got %q", want, got)
+	want := []string{secTestServiceName, testServiceName}
+	if !cmp.Equal(got, want) {
+		t.Errorf("Annotations = %v, want: %v", got, want)
 	}
 }
 
 func TestConfigurationHasNoKubectlAnnotation(t *testing.T) {
 	s := createServiceWithKubectlAnnotation()
-	c, err := makeConfiguration(s)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
+	c := MakeConfiguration(s)
 	if v, ok := c.Annotations[corev1.LastAppliedConfigAnnotation]; ok {
-		t.Errorf("Annotation %s = %q, want empty", corev1.LastAppliedConfigAnnotation, v)
+		t.Errorf(`Annotation[%s] = %q, want: ""`, corev1.LastAppliedConfigAnnotation, v)
 	}
 }

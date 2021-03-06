@@ -19,26 +19,27 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kelseyhightower/envconfig"
+	"go.uber.org/zap"
+
 	// Injection related imports.
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	"knative.dev/pkg/injection"
-	revisioninformer "knative.dev/serving/pkg/client/injection/informers/serving/v1alpha1/revision"
+	"knative.dev/serving/pkg/activator"
 
-	"github.com/kelseyhightower/envconfig"
-	"go.opencensus.io/stats/view"
-	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	network "knative.dev/networking/pkg"
 	"knative.dev/pkg/configmap"
+	configmapinformer "knative.dev/pkg/configmap/informer"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/injection/sharedmain"
 	pkglogging "knative.dev/pkg/logging"
@@ -52,89 +53,41 @@ import (
 	tracingconfig "knative.dev/pkg/tracing/config"
 	"knative.dev/pkg/version"
 	"knative.dev/pkg/websocket"
-	"knative.dev/serving/pkg/activator"
 	activatorconfig "knative.dev/serving/pkg/activator/config"
 	activatorhandler "knative.dev/serving/pkg/activator/handler"
 	activatornet "knative.dev/serving/pkg/activator/net"
-	"knative.dev/serving/pkg/apis/networking"
-	"knative.dev/serving/pkg/autoscaler"
-	"knative.dev/serving/pkg/goversion"
+	asmetrics "knative.dev/serving/pkg/autoscaler/metrics"
 	pkghttp "knative.dev/serving/pkg/http"
 	"knative.dev/serving/pkg/logging"
-	"knative.dev/serving/pkg/network"
-	"knative.dev/serving/pkg/queue"
+	"knative.dev/serving/pkg/networking"
 )
-
-// Fail if using unsupported go version.
-var _ = goversion.IsSupported()
 
 const (
 	component = "activator"
-
-	// Add enough buffer to not block request serving on stats collection
-	requestCountingQueueLength = 100
-
-	// The number of requests that are queued on the breaker before the 503s are sent.
-	// The value must be adjusted depending on the actual production requirements.
-	breakerQueueDepth = 10000
-
-	// The upper bound for concurrent requests sent to the revision.
-	// As new endpoints show up, the Breakers concurrency increases up to this value.
-	breakerMaxConcurrency = 1000
 
 	// The port on which autoscaler WebSocket server listens.
 	autoscalerPort = ":8080"
 )
 
-var (
-	masterURL = flag.String("master", "", "The address of the Kubernetes API server. "+
-		"Overrides any value in kubeconfig. Only required if out-of-cluster.")
-	kubeconfig = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-)
-
-func statReporter(statSink *websocket.ManagedConnection, stopCh <-chan struct{},
-	statChan <-chan []autoscaler.StatMessage, logger *zap.SugaredLogger) {
-	for {
-		select {
-		case sm := <-statChan:
-			go func() {
-				for _, msg := range sm {
-					if err := statSink.Send(msg); err != nil {
-						logger.Errorw("Error while sending stat", zap.Error(err))
-					}
-				}
-			}()
-		case <-stopCh:
-			// It's a sending connection, so no drainage required.
-			statSink.Shutdown()
-			return
-		}
-	}
-}
-
 type config struct {
 	PodName string `split_words:"true" required:"true"`
 	PodIP   string `split_words:"true" required:"true"`
+
+	// These are here to allow configuring higher values of keep-alive for larger environments.
+	// TODO: run loadtests using these flags to determine optimal default values.
+	MaxIdleProxyConns        int `split_words:"true" default:"1000"`
+	MaxIdleProxyConnsPerHost int `split_words:"true" default:"100"`
 }
 
 func main() {
-	flag.Parse()
-
 	// Set up a context that we can cancel to tell informers and other subprocesses to stop.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Report stats on Go memory usage every 30 seconds.
-	msp := metrics.NewMemStatsAll()
-	msp.Start(ctx, 30*time.Second)
-	if err := view.Register(msp.DefaultViews()...); err != nil {
-		log.Fatalf("Error exporting go memstats view: %v", err)
-	}
+	metrics.MemStatsOrDie(ctx)
 
-	cfg, err := sharedmain.GetConfig(*masterURL, *kubeconfig)
-	if err != nil {
-		log.Fatal("Error building kubeconfig:", err)
-	}
+	cfg := injection.ParseAndGetRESTConfigOrDie()
 
 	log.Printf("Registering %d clients", len(injection.Default.GetClients()))
 	log.Printf("Registering %d informer factories", len(injection.Default.GetInformerFactories()))
@@ -144,15 +97,16 @@ func main() {
 
 	var env config
 	if err := envconfig.Process("", &env); err != nil {
-		log.Fatalf("Failed to process env: %v", err)
+		log.Fatal("Failed to process env: ", err)
 	}
 
 	kubeClient := kubeclient.Get(ctx)
 
 	// We sometimes startup faster than we can reach kube-api. Poll on failure to prevent us terminating
+	var err error
 	if perr := wait.PollImmediate(time.Second, 60*time.Second, func() (bool, error) {
 		if err = version.CheckMinimumVersion(kubeClient.Discovery()); err != nil {
-			log.Printf("Failed to get k8s version %v", err)
+			log.Print("Failed to get k8s version ", err)
 		}
 		return err == nil, nil
 	}); perr != nil {
@@ -178,26 +132,19 @@ func main() {
 
 	logger.Info("Starting the knative activator")
 
-	reporter, err := activator.NewStatsReporter(env.PodName)
-	if err != nil {
-		logger.Fatalw("Failed to create stats reporter", zap.Error(err))
-	}
-
-	statCh := make(chan []autoscaler.StatMessage)
-	defer close(statCh)
-
-	reqCh := make(chan activatorhandler.ReqEvent, requestCountingQueueLength)
-	defer close(reqCh)
-
-	params := queue.BreakerParams{QueueDepth: breakerQueueDepth, MaxConcurrency: breakerMaxConcurrency, InitialCapacity: 0}
+	// Create the transport used by both the activator->QP probe and the proxy.
+	// It's important that the throttler and the activatorhandler share this
+	// transport so that throttler probe connections can be reused after probing
+	// (via keep-alive) to send real requests, avoiding needing an extra
+	// reconnect for the first request after the probe succeeds.
+	logger.Debugf("MaxIdleProxyConns: %d, MaxIdleProxyConnsPerHost: %d", env.MaxIdleProxyConns, env.MaxIdleProxyConnsPerHost)
+	transport := pkgnet.NewProxyAutoTransport(env.MaxIdleProxyConns, env.MaxIdleProxyConnsPerHost)
 
 	// Start throttler.
-	throttler := activatornet.NewThrottler(ctx, params,
-		// We want to join host port since that will be our search space in the Throttler.
-		net.JoinHostPort(env.PodIP, strconv.Itoa(networking.BackendHTTPPort)))
-	go throttler.Run(ctx)
+	throttler := activatornet.NewThrottler(ctx, env.PodIP)
+	go throttler.Run(ctx, transport)
 
-	oct := tracing.NewOpenCensusTracer(tracing.WithExporter(networking.ActivatorServiceName, logger))
+	oct := tracing.NewOpenCensusTracer(tracing.WithExporterFull(networking.ActivatorServiceName, env.PodIP, logger))
 
 	tracerUpdater := configmap.TypeFilter(&tracingconfig.Config{})(func(name string, value interface{}) {
 		cfg := value.(*tracingconfig.Config)
@@ -208,50 +155,50 @@ func main() {
 	})
 
 	// Set up our config store
-	configMapWatcher := configmap.NewInformedWatcher(kubeClient, system.Namespace())
+	configMapWatcher := configmapinformer.NewInformedWatcher(kubeClient, system.Namespace())
 	configStore := activatorconfig.NewStore(logger, tracerUpdater)
 	configStore.WatchConfigs(configMapWatcher)
+
+	statCh := make(chan []asmetrics.StatMessage)
+	defer close(statCh)
 
 	// Open a WebSocket connection to the autoscaler.
 	autoscalerEndpoint := fmt.Sprintf("ws://%s.%s.svc.%s%s", "autoscaler", system.Namespace(), pkgnet.GetClusterDomainName(), autoscalerPort)
 	logger.Info("Connecting to Autoscaler at ", autoscalerEndpoint)
 	statSink := websocket.NewDurableSendingConnection(autoscalerEndpoint, logger)
-	go statReporter(statSink, ctx.Done(), statCh, logger)
+	defer statSink.Shutdown()
+	go activator.ReportStats(logger, statSink, statCh)
 
 	// Create and run our concurrency reporter
-	reportTicker := time.NewTicker(time.Second)
-	defer reportTicker.Stop()
-	cr := activatorhandler.NewConcurrencyReporter(ctx, env.PodName, reqCh,
-		reportTicker.C, statCh, reporter)
-	go cr.Run(ctx.Done())
+	concurrencyReporter := activatorhandler.NewConcurrencyReporter(ctx, env.PodName, statCh)
+	go concurrencyReporter.Run(ctx.Done())
 
 	// Create activation handler chain
 	// Note: innermost handlers are specified first, ie. the last handler in the chain will be executed first
-	var ah http.Handler = activatorhandler.New(
-		ctx,
-		throttler,
-		reporter)
-	ah = activatorhandler.NewRequestEventHandler(reqCh, ah)
+	var ah http.Handler = activatorhandler.New(ctx, throttler, transport)
+	ah = concurrencyReporter.Handler(ah)
 	ah = tracing.HTTPSpanMiddleware(ah)
 	ah = configStore.HTTPMiddleware(ah)
 	reqLogHandler, err := pkghttp.NewRequestLogHandler(ah, logging.NewSyncFileWriter(os.Stdout), "",
-		requestLogTemplateInputGetter(revisioninformer.Get(ctx).Lister()), false /*enableProbeRequestLog*/)
+		requestLogTemplateInputGetter, false /*enableProbeRequestLog*/)
 	if err != nil {
 		logger.Fatalw("Unable to create request log handler", zap.Error(err))
 	}
 	ah = reqLogHandler
+
+	// NOTE: MetricHandler is being used as the outermost handler of the meaty bits. We're not interested in measuring
+	// the healthchecks or probes.
+	ah = activatorhandler.NewMetricHandler(env.PodName, ah)
+	ah = activatorhandler.NewContextHandler(ctx, ah)
+
+	// Network probe handlers.
 	ah = &activatorhandler.ProbeHandler{NextHandler: ah}
-
-	sigCtx, sigCancel := context.WithCancel(context.Background())
-
-	// Set up our health check based on the health of stat sink and environmental factors.
-	hc := newHealthCheck(sigCtx, logger, statSink)
-	ah = &activatorhandler.HealthHandler{HealthCheck: hc, NextHandler: ah}
-
 	ah = network.NewProbeHandler(ah)
 
-	// NOTE: MetricHandler is being used as the outermost handler for the purpose of measuring the request latency.
-	ah = activatorhandler.NewMetricHandler(ctx, reporter, ah)
+	// Set up our health check based on the health of stat sink and environmental factors.
+	sigCtx, sigCancel := context.WithCancel(context.Background())
+	hc := newHealthCheck(sigCtx, logger, statSink)
+	ah = &activatorhandler.HealthHandler{HealthCheck: hc, NextHandler: ah, Logger: logger}
 
 	profilingHandler := profiling.NewHandler(logger, false)
 	// Watch the logging config map and dynamically update logging levels.
@@ -259,7 +206,7 @@ func main() {
 
 	// Watch the observability config map
 	configMapWatcher.Watch(metrics.ConfigMapName(),
-		metrics.UpdateExporterFromConfigMap(component, logger),
+		metrics.ConfigMapWatcher(ctx, component, nil /* SecretFetcher */, logger),
 		updateRequestLogFromConfigMap(logger, reqLogHandler),
 		profilingHandler.UpdateFromConfigMap)
 
@@ -268,8 +215,8 @@ func main() {
 	}
 
 	servers := map[string]*http.Server{
-		"http1":   network.NewServer(":"+strconv.Itoa(networking.BackendHTTPPort), ah),
-		"h2c":     network.NewServer(":"+strconv.Itoa(networking.BackendHTTP2Port), ah),
+		"http1":   pkgnet.NewServer(":"+strconv.Itoa(networking.BackendHTTPPort), ah),
+		"h2c":     pkgnet.NewServer(":"+strconv.Itoa(networking.BackendHTTP2Port), ah),
 		"profile": profiling.NewServer(profilingHandler),
 	}
 
@@ -277,7 +224,7 @@ func main() {
 	for name, server := range servers {
 		go func(name string, s *http.Server) {
 			// Don't forward ErrServerClosed as that indicates we're already shutting down.
-			if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("%s server failed: %w", name, err)
 			}
 		}(name, server)
@@ -297,7 +244,8 @@ func main() {
 
 	// The drain has started (we are now failing readiness probes).  Let the effects of this
 	// propagate so that new requests are no longer routed our way.
-	time.Sleep(30 * time.Second)
+	logger.Infof("Sleeping %v to allow K8s propagation of non-ready state", pkgnet.DefaultDrainTimeout)
+	time.Sleep(pkgnet.DefaultDrainTimeout)
 	logger.Info("Done waiting, shutting down servers.")
 
 	// Drain outstanding requests, and stop accepting new ones.
@@ -314,7 +262,7 @@ func newHealthCheck(sigCtx context.Context, logger *zap.SugaredLogger, statSink 
 		// When we get SIGTERM (sigCtx done), let readiness probes start failing.
 		case <-sigCtx.Done():
 			once.Do(func() {
-				logger.Info("signal context canceled")
+				logger.Info("Signal context canceled")
 			})
 			return errors.New("received SIGTERM from kubelet")
 		default:

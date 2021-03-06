@@ -32,6 +32,6 @@ type ResourceObjects struct {
 }
 
 // LogResourceObject logs the resource object with the resource name and value
-func LogResourceObject(t *testing.T, value ResourceObjects) {
-	t.Logf("resource %s", spew.Sprint(value))
+func LogResourceObject(t testing.TB, value ResourceObjects) {
+	t.Log("", "resource", spew.Sprint(value))
 }

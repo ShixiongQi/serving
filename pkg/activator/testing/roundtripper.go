@@ -21,9 +21,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
-	"sync/atomic"
 
-	"knative.dev/serving/pkg/network"
+	"go.uber.org/atomic"
+
+	network "knative.dev/networking/pkg"
 	"knative.dev/serving/pkg/queue"
 )
 
@@ -46,7 +47,7 @@ type FakeRoundTripper struct {
 	// no host is matched then this falls back to the behavior or ProbeResponses
 	ProbeHostResponses map[string][]FakeResponse
 
-	// Responses to probe requests are popeed from this list until it is size 1 then
+	// Responses to probe requests are popped from this list until it is size 1 then
 	// that response is returned indefinitely
 	ProbeResponses []FakeResponse
 
@@ -54,7 +55,7 @@ type FakeRoundTripper struct {
 	RequestResponse *FakeResponse
 	responseMux     sync.Mutex
 
-	NumProbes int32
+	NumProbes atomic.Int32
 }
 
 func defaultProbeResponse() *FakeResponse {
@@ -110,7 +111,7 @@ func (rt *FakeRoundTripper) popResponse(host string) *FakeResponse {
 // RT is a RoundTripperFunc
 func (rt *FakeRoundTripper) RT(req *http.Request) (*http.Response, error) {
 	if req.Header.Get(network.ProbeHeaderName) != "" {
-		atomic.AddInt32(&rt.NumProbes, 1)
+		rt.NumProbes.Inc()
 		resp := rt.popResponse(req.URL.Host)
 		if resp.Err != nil {
 			return nil, resp.Err

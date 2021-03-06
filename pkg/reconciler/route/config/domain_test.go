@@ -1,5 +1,5 @@
 /*
-Copyright 2018 The Knative Authors.
+Copyright 2018 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,15 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	. "knative.dev/pkg/configmap/testing"
+
+	netpkg "knative.dev/networking/pkg"
 	"knative.dev/pkg/network"
 	"knative.dev/pkg/system"
 
+	. "knative.dev/pkg/configmap/testing"
 	_ "knative.dev/pkg/system/testing"
 )
 
@@ -67,7 +70,7 @@ func TestNewConfigNoEntry(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Errorf("Unexpected error when config file has no entry: %v", err)
+		t.Error("Unexpected error when config file has no entry:", err)
 	}
 	got := d.LookupDomainForLabels(nil)
 	if got != DefaultDomain {
@@ -119,10 +122,10 @@ func TestNewConfig(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+		t.Error("Unexpected error:", err)
 	}
 	if diff := cmp.Diff(&expectedConfig, c); diff != "" {
-		t.Errorf("Unexpected config diff (-want +got): %s", diff)
+		t.Error("Unexpected config diff (-want +got):", diff)
 	}
 }
 
@@ -172,7 +175,7 @@ func TestLookupDomainForLabels(t *testing.T) {
 		labels: map[string]string{},
 		domain: "default.com",
 	}, {
-		labels: map[string]string{"serving.knative.dev/visibility": "cluster-local"},
+		labels: map[string]string{netpkg.VisibilityLabelKey: "cluster-local"},
 		domain: "svc." + network.GetClusterDomainName(),
 	}}
 
@@ -187,9 +190,9 @@ func TestLookupDomainForLabels(t *testing.T) {
 func TestOurDomain(t *testing.T) {
 	cm, example := ConfigMapsFromTestFile(t, DomainConfigName)
 	if _, err := NewDomainFromConfigMap(cm); err != nil {
-		t.Errorf("NewDomainFromConfigMap(actual) = %v", err)
+		t.Error("NewDomainFromConfigMap(actual) =", err)
 	}
 	if _, err := NewDomainFromConfigMap(example); err != nil {
-		t.Errorf("NewDomainFromConfigMap(example) = %v", err)
+		t.Error("NewDomainFromConfigMap(example) =", err)
 	}
 }

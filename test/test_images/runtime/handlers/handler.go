@@ -1,10 +1,13 @@
 /*
 Copyright 2019 The Knative Authors
- Licensed under the Apache License, Version 2.0 (the "License");
+
+Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-     http://www.apache.org/licenses/LICENSE-2.0
- Unless required by applicable law or agreed to in writing, software
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
@@ -18,15 +21,16 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 
-	"knative.dev/serving/pkg/network"
+	network "knative.dev/networking/pkg"
 )
 
 // InitHandlers initializes all handlers.
 func InitHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/", withHeaders(withRequestLog(runtimeHandler)))
-	mux.HandleFunc("/healthz", withRequestLog(withKubeletProbeHeaderCheck))
+
+	h := network.NewProbeHandler(withRequestLog(withKubeletProbeHeaderCheck))
+	mux.HandleFunc(network.ProbePath, h.ServeHTTP)
 }
 
 // withRequestLog logs each request before handling it.
@@ -45,7 +49,7 @@ func withRequestLog(next http.HandlerFunc) http.HandlerFunc {
 
 // withKubeletProbeHeaderCheck checks each health request has Kubelet probe header
 func withKubeletProbeHeaderCheck(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.Header.Get("User-Agent"), network.KubeProbeUAPrefix) {
+	if !network.IsKubeletProbe(r) {
 		w.WriteHeader(http.StatusBadRequest)
 	} else {
 		w.WriteHeader(http.StatusOK)
